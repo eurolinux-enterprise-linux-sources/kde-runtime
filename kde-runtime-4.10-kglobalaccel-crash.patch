@@ -1,0 +1,21 @@
+commit a99135656453d613f62b568adb1be88ef5425ed6
+Author: Dan Vrátil <dvratil@redhat.com>
+Date:   Fri Oct 11 18:30:22 2013 +0200
+
+    Fix crash when activeGlobalShortcutContext is called with invalid component
+
+diff --git a/kglobalaccel/kglobalacceld.cpp b/kglobalaccel/kglobalacceld.cpp
+index 53ac5b0..3e22893 100644
+--- a/kglobalaccel/kglobalacceld.cpp
++++ b/kglobalaccel/kglobalacceld.cpp
+@@ -381,8 +381,8 @@ void KGlobalAccelD::activateGlobalShortcutContext(
+ {
+     KdeDGlobalAccel::Component *const comp =
+         GlobalShortcutsRegistry::self()->getComponent(component);
+-
+-    comp->activateGlobalShortcutContext(uniqueName);
++    if (comp)
++        comp->activateGlobalShortcutContext(uniqueName);
+ }
+ 
+ 

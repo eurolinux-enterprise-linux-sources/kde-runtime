@@ -1,0 +1,8 @@
+LIBRARY      kdecm
+;DESCRIPTION  'KDE Shell Extension'
+
+EXPORTS
+  DllCanUnloadNow PRIVATE
+  DllGetClassObject PRIVATE
+  DllRegisterServer PRIVATE
+  DllUnregisterServer PRIVATE

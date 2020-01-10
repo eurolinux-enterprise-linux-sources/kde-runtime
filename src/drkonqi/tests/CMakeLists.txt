@@ -1,0 +1,3 @@
+add_subdirectory(crashtest)
+add_subdirectory(backtraceparsertest)
+add_subdirectory(bugzillalibtest)

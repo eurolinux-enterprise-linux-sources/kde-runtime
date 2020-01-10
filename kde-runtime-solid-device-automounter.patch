@@ -1,0 +1,47 @@
+diff --git a/solid-device-automounter/kcm/DeviceAutomounterKCM.cpp b/solid-device-automounter/kcm/DeviceAutomounterKCM.cpp
+index 42fbfae..80f6d28 100644
+--- a/solid-device-automounter/kcm/DeviceAutomounterKCM.cpp
++++ b/solid-device-automounter/kcm/DeviceAutomounterKCM.cpp
+@@ -57,6 +57,7 @@ DeviceAutomounterKCM::DeviceAutomounterKCM(QWidget *parent, const QVariantList &
+ 
+     m_devices = new DeviceModel(this);
+     deviceView->setModel(m_devices);
++    deviceView->setEnabled(true);
+ 
+     connect(automountOnLogin, SIGNAL(stateChanged(int)), this, SLOT(emitChanged()));
+     connect(automountOnPlugin, SIGNAL(stateChanged(int)), this, SLOT(emitChanged()));
+@@ -112,12 +113,10 @@ DeviceAutomounterKCM::enabledChanged()
+         automountOnLogin->setEnabled(false);
+         automountOnPlugin->setEnabled(false);
+         automountUnknownDevices->setEnabled(false);
+-        deviceView->setEnabled(false);
+     } else {
+         automountOnLogin->setEnabled(true);
+         automountOnPlugin->setEnabled(true);
+         automountUnknownDevices->setEnabled(true);
+-        deviceView->setEnabled(true);
+     }
+ }
+ 
+diff --git a/solid-device-automounter/kcm/DeviceModel.cpp b/solid-device-automounter/kcm/DeviceModel.cpp
+index 9469cb6..7ab6eb4 100644
+--- a/solid-device-automounter/kcm/DeviceModel.cpp
++++ b/solid-device-automounter/kcm/DeviceModel.cpp
+@@ -60,7 +60,8 @@ void
+ DeviceModel::deviceAttached(const QString &udi)
+ {
+     Solid::Device dev(udi);
+-    if (dev.is<Solid::StorageVolume>()) {
++    Solid::StorageVolume *volume = dev.as<Solid::StorageVolume>();
++    if (volume && !volume->isIgnored()) {
+         if (m_disconnected.contains(udi)) {
+             emit layoutAboutToBeChanged();
+             beginRemoveRows(index(1, 0), m_disconnected.indexOf(udi), m_disconnected.indexOf(udi));
+@@ -81,7 +82,6 @@ DeviceModel::deviceRemoved(const QString &udi)
+         m_attached.removeOne(udi);
+         endRemoveRows();
+         emit layoutChanged();
+-        addNewDevice(udi);
+     }
+ }
+ 
