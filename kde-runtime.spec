@@ -6,7 +6,7 @@
 Name:    kde-runtime
 Summary: KDE Runtime
 Version: 4.10.5
-Release: 11%{?dist}
+Release: 2%{?dist}
 
 # http://techbase.kde.org/Policies/Licensing_Policy
 License: LGPLv2+ and GPLv2+
@@ -49,7 +49,7 @@ Patch11: kde-runtime-4.10.4-trash-readonly.patch
 # make nepomuk menu items (with oxygen-only icons atm) OnlyShowIn=KDE;
 Patch50: kde-runtime-4.7.90-nepomuk_onlyshowin_kde.patch
 
-# make installdbgsymbols.sh use pkexec instead of su
+# make installdbgsymbols.sh use pkexec instead of su 
 # increase some timeouts in an effort to see (some) errors before close
 Patch51: kde-runtime-4.9.0-installdbgsymbols.patch
 
@@ -57,21 +57,12 @@ Patch51: kde-runtime-4.9.0-installdbgsymbols.patch
 # https://bugs.kde.org/show_bug.cgi?id=316546
 Patch52: kde-runtime-mouseeventlistener.patch
 
-# Make kdesu full RELRO
-Patch53: kde-runtime-4.10.5-kdesu-fullrelro.patch
-
-# Bug 1084191 - In System Settings -> Removable Devices, adding duplicates of USB device
-# Bug 1084497 - KDE cannot disable automount for removable media
-Patch54: kde-runtime-solid-device-automounter.patch
-
 ## upstream patches
 # upstreamed patch for RHBZ#1018207
 Patch100: kde-runtime-4.10-kglobalaccel-crash.patch
-Patch101: kwalletd-new.patch
 
 # rhel patches
 Patch300: kde-runtime-4.9.2-webkit.patch
-
 
 Obsoletes: kdebase-runtime < 4.7.97-10
 Provides:  kdebase-runtime = %{version}-%{release}
@@ -81,7 +72,7 @@ Provides:  kdebase4-runtime = %{version}-%{release}
 Obsoletes: nepomukcontroller < 1:0.2
 Provides:  nepomukcontroller = 1:0.2-1
 
-# knotify4 provides dbus service org.freedesktop.Notifications too
+# knotify4 provides dbus service org.freedesktop.Notifications too 
 Provides: desktop-notification-daemon
 
 %{?_kde4_macros_api:Requires: kde4-macros(api) = %{_kde4_macros_api} }
@@ -105,7 +96,6 @@ Requires: icoutils
 # beware of bootstrapping, there be dragons
 Requires: oxygen-icon-theme >= %{version}
 
-BuildRequires: gpgme-devel
 BuildRequires: bzip2-devel
 BuildRequires: chrpath
 BuildRequires: clucene-core-devel
@@ -120,7 +110,7 @@ BuildRequires: pkgconfig(alsa)
 BuildRequires: pkgconfig(exiv2)
 BuildRequires: pkgconfig(OpenEXR)
 BuildRequires: pkgconfig(openssl)
-BuildRequires: pkgconfig(polkit-qt-1)
+BuildRequires: pkgconfig(polkit-qt-1) 
 BuildRequires: pkgconfig(libattica)
 BuildRequires: pkgconfig(libcanberra)
 BuildRequires: pkgconfig(libpulse)
@@ -154,7 +144,7 @@ Core runtime for KDE 4.
 %package devel
 Summary:  Developer files for %{name}
 Obsoletes: kdebase-runtime-devel < 4.7.97-10
-Provides:  kdebase-runtime-devel = %{version}-%{release}
+Provides:  kdebase-runtime-devel = %{version}-%{release} 
 Requires: %{name}-libs%{?_isa} = %{?epoch:%{epoch}:}%{version}-%{release}
 %description devel
 %{summary}.
@@ -209,10 +199,7 @@ Requires: %{name} = %{version}-%{release}
 %patch50 -p1 -b .nepomuk_onlyshowin_kde
 %patch51 -p1 -b .installdgbsymbols
 %patch52 -p1 -b .mouseeventlistener
-%patch53 -p1 -b .fullrelro
-%patch54 -p1 -b .solid-device-automounter
 %patch100 -p1 -b .kglobalaccel
-%patch101 -p0 -b .kwalletd-new
 
 %if ! 0%{?webkit}
 %patch300 -p1 -b .webkit
@@ -225,7 +212,7 @@ mkdir -p %{_target_platform}
 pushd %{_target_platform}
 %{cmake_kde4} \
   %{?no_webkit} \
-  ..
+  .. 
 popd
 
 make %{?_smp_mflags} -C %{_target_platform}
@@ -240,7 +227,6 @@ for f in kioslave/nepomuksearch kcontrol/spellchecking kcontrol/performance \
    bunzip2 %{buildroot}%{_kde4_docdir}/HTML/en/$f/index.cache.bz2
    sed -i -e 's!name="id[a-z]*[0-9]*"!!g' %{buildroot}%{_kde4_docdir}/HTML/en/$f/index.cache
    sed -i -e 's!#id[a-z]*[0-9]*"!!g' %{buildroot}%{_kde4_docdir}/HTML/en/$f/index.cache
-   sed -i -e 's!ftn.id[a-z]*[0-9]*"!ftn.id-123456!g' %{buildroot}%{_kde4_docdir}/HTML/en/$f/index.cache
    bzip2 -9 %{buildroot}%{_kde4_docdir}/HTML/en/$f/index.cache
 done
 
@@ -430,38 +416,6 @@ fi
 
 
 %changelog
-* Thu Oct 05 2017 Jan Grulich <jgrulich@redhat.com - 4.10.5-11
-- Rebuild exiv2
-  Resolves: bz#1488008
-
-* Tue Sep 19 2017 Jan Grulich <jgrulich@redhat.com> - 4.10.5-10
-- Avoid duplicates in solid device automounter kcm
-  Resolves: bz#1084191
-- Enable automount overrides even when automatic mounting is disabled
-  Resolves: bz#1084497
-
-* Wed Sep 06 2017 Jan Grulich <jgrulich@redhat.com - 4.10.5-9
-- Rebuild exiv2
-  Resolves: bz#1488008
-
-* Mon Mar 17 2014 Than Ngo <than@redhat.com> - 4.10.5-8
-- fix multilib issue
-
-* Mon Mar 10 2014 Than Ngo <than@redhat.com> - 4.10.5-7
-- add missing BR on gpgme-devel
-
-* Mon Mar 10 2014 Than Ngo <than@redhat.com> - 4.10.5-6
-- backport new kwalletd
-
-* Fri Jan 24 2014 Daniel Mach <dmach@redhat.com> - 4.10.5-5
-- Mass rebuild 2014-01-24
-
-* Fri Dec 27 2013 Daniel Mach <dmach@redhat.com> - 4.10.5-4
-- Mass rebuild 2013-12-27
-
-* Tue Dec 10 2013 Jan Grulich <jgrulich@redhat.com> - 4.10.5-3
-- Make kdesu full RELRO (#884056)
-
 * Wed Oct 30 2013 Daniel Vrátil <dvratil@redhat.com> - 4.10.5-2
 - fix: crash on invalid input on KGlobalAccel DBus interface (#1018207)
 
@@ -561,7 +515,7 @@ fi
 - update webkit patch
 
 * Tue Oct 02 2012 Rex Dieter <rdieter@fedoraproject.org> 4.9.2-2
-- kde-runtime-4.9.2 is missing kio_smb (#862169)
+- kde-runtime-4.9.2 is missing kio_smb (#862169) 
 
 * Fri Sep 28 2012 Rex Dieter <rdieter@fedoraproject.org> - 4.9.2-1
 - 4.9.2
@@ -740,7 +694,7 @@ fi
 - Nepomuk IndexCleaner throttling (kdebz#276593)
 
 * Tue Jun 28 2011 Rex Dieter <rdieter@fedoraproject.org> 4.6.90-2
-- move oxygen-icons-theme dep (back) here from kdelibs
+- move oxygen-icons-theme dep (back) here from kdelibs 
 
 * Mon Jun 27 2011 Than Ngo <than@redhat.com> - 4.6.90-1
 - 4.6.90 (rc1)
@@ -754,7 +708,7 @@ fi
 - upstream tarball is now kde-runtime
 
 * Thu Apr 28 2011 Rex Dieter <rdieter@fedoraproject.org> - 4.6.3-1
-- 4.6.3
+- 4.6.3 
 
 * Wed Apr 06 2011 Than Ngo <than@redhat.com> - 4.6.2-1
 - 4.6.2
@@ -855,7 +809,7 @@ fi
 - 4.5 Beta 2 (4.4.85)
 - added remote widgets service and policy (from kdelibs)
 
-* Mon May 31 2010 Rex Dieter <rdieter@fedoraproject.org> - 4.4.80-2
+* Mon May 31 2010 Rex Dieter <rdieter@fedoraproject.org> - 4.4.80-2 
 - rebuild (exiv2)
 
 * Fri May 21 2010 Jaroslav Reznik <jreznik@redhat.com> - 4.4.80-1
