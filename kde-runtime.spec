@@ -6,7 +6,7 @@
 Name:    kde-runtime
 Summary: KDE Runtime
 Version: 4.10.5
-Release: 2%{?dist}
+Release: 8%{?dist}
 
 # http://techbase.kde.org/Policies/Licensing_Policy
 License: LGPLv2+ and GPLv2+
@@ -57,9 +57,13 @@ Patch51: kde-runtime-4.9.0-installdbgsymbols.patch
 # https://bugs.kde.org/show_bug.cgi?id=316546
 Patch52: kde-runtime-mouseeventlistener.patch
 
+# Make kdesu full RELRO
+Patch53: kde-runtime-4.10.5-kdesu-fullrelro.patch
+
 ## upstream patches
 # upstreamed patch for RHBZ#1018207
 Patch100: kde-runtime-4.10-kglobalaccel-crash.patch
+Patch101: kwalletd-new.patch
 
 # rhel patches
 Patch300: kde-runtime-4.9.2-webkit.patch
@@ -96,6 +100,7 @@ Requires: icoutils
 # beware of bootstrapping, there be dragons
 Requires: oxygen-icon-theme >= %{version}
 
+BuildRequires: gpgme-devel
 BuildRequires: bzip2-devel
 BuildRequires: chrpath
 BuildRequires: clucene-core-devel
@@ -199,7 +204,9 @@ Requires: %{name} = %{version}-%{release}
 %patch50 -p1 -b .nepomuk_onlyshowin_kde
 %patch51 -p1 -b .installdgbsymbols
 %patch52 -p1 -b .mouseeventlistener
+%patch53 -p1 -b .fullrelro
 %patch100 -p1 -b .kglobalaccel
+%patch101 -p0 -b .kwalletd-new
 
 %if ! 0%{?webkit}
 %patch300 -p1 -b .webkit
@@ -227,6 +234,7 @@ for f in kioslave/nepomuksearch kcontrol/spellchecking kcontrol/performance \
    bunzip2 %{buildroot}%{_kde4_docdir}/HTML/en/$f/index.cache.bz2
    sed -i -e 's!name="id[a-z]*[0-9]*"!!g' %{buildroot}%{_kde4_docdir}/HTML/en/$f/index.cache
    sed -i -e 's!#id[a-z]*[0-9]*"!!g' %{buildroot}%{_kde4_docdir}/HTML/en/$f/index.cache
+   sed -i -e 's!ftn.id[a-z]*[0-9]*"!ftn.id-123456!g' %{buildroot}%{_kde4_docdir}/HTML/en/$f/index.cache
    bzip2 -9 %{buildroot}%{_kde4_docdir}/HTML/en/$f/index.cache
 done
 
@@ -416,6 +424,24 @@ fi
 
 
 %changelog
+* Mon Mar 17 2014 Than Ngo <than@redhat.com> - 4.10.5-8
+- fix multilib issue
+
+* Mon Mar 10 2014 Than Ngo <than@redhat.com> - 4.10.5-7
+- add missing BR on gpgme-devel
+
+* Mon Mar 10 2014 Than Ngo <than@redhat.com> - 4.10.5-6
+- backport new kwalletd
+
+* Fri Jan 24 2014 Daniel Mach <dmach@redhat.com> - 4.10.5-5
+- Mass rebuild 2014-01-24
+
+* Fri Dec 27 2013 Daniel Mach <dmach@redhat.com> - 4.10.5-4
+- Mass rebuild 2013-12-27
+
+* Tue Dec 10 2013 Jan Grulich <jgrulich@redhat.com> - 4.10.5-3
+- Make kdesu full RELRO (#884056)
+
 * Wed Oct 30 2013 Daniel Vrátil <dvratil@redhat.com> - 4.10.5-2
 - fix: crash on invalid input on KGlobalAccel DBus interface (#1018207)
 

@@ -1,0 +1,3677 @@
+diff -Nur kwalletd.than/backend/backendpersisthandler.cpp kwalletd/backend/backendpersisthandler.cpp
+--- kwalletd.than/backend/backendpersisthandler.cpp	1970-01-01 01:00:00.000000000 +0100
++++ kwalletd/backend/backendpersisthandler.cpp	2014-02-26 09:34:12.000000000 +0100
+@@ -0,0 +1,731 @@
++/**
++  * This file is part of the KDE project
++  * Copyright (C) 2013 Valentin Rusu <kde@rusu.info>
++  *
++  * This library is free software; you can redistribute it and/or
++  * modify it under the terms of the GNU Library General Public
++  * License version 2 as published by the Free Software Foundation.
++  *
++  * This library is distributed in the hope that it will be useful,
++  * but WITHOUT ANY WARRANTY; without even the implied warranty of
++  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  * Library General Public License for more details.
++  *
++  * You should have received a copy of the GNU Library General Public License
++  * along with this library; see the file COPYING.LIB.  If not, write to
++  * the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
++  * Boston, MA 02110-1301, USA.
++  */
++
++#include <QIODevice>
++#include <QFile>
++#include <QTextDocument>
++#include <assert.h>
++#include <ksavefile.h>
++#include <kdebug.h>
++#include <kmessagebox.h>
++#include <klocalizedstring.h>
++#ifdef HAVE_QGPGME
++#include <gpgme.h>
++#include <gpgme++/context.h>
++#include <gpgme++/key.h>
++#include <gpgme++/keylistresult.h>
++#include <gpgme++/data.h>
++#include <gpgme++/encryptionresult.h>
++#include <gpgme++/decryptionresult.h>
++#endif
++#include "backendpersisthandler.h"
++#include "kwalletbackend.h"
++#include "blowfish.h"
++#include "sha1.h"
++#include "cbc.h"
++
++#ifdef Q_OS_WIN 
++#include <windows.h>
++#include <wincrypt.h>
++#endif
++
++#define KWALLET_CIPHER_BLOWFISH_CBC 0
++#define KWALLET_CIPHER_3DES_CBC     1 // unsupported
++#define KWALLET_CIPHER_GPG          2
++
++#define KWALLET_HASH_SHA1       0
++#define KWALLET_HASH_MD5        1 // unsupported
++
++namespace KWallet {
++
++static int getRandomBlock(QByteArray& randBlock) {
++
++#ifdef Q_OS_WIN //krazy:exclude=cpp
++
++    // Use windows crypto API to get randomness on win32
++    // HACK: this should be done using qca
++    HCRYPTPROV hProv;
++
++    if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL,
++        CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) return -1; // couldn't get random data
++
++    if (!CryptGenRandom(hProv, static_cast<DWORD>(randBlock.size()),
++        (BYTE*)randBlock.data())) {
++        return -3; // read error
++    }
++
++    // release the crypto context
++    CryptReleaseContext(hProv, 0);
++
++    return randBlock.size();
++
++#else
++
++    // First try /dev/urandom
++    if (QFile::exists("/dev/urandom")) {
++        QFile devrand("/dev/urandom");
++        if (devrand.open(QIODevice::ReadOnly)) {
++            int rc = devrand.read(randBlock.data(), randBlock.size());
++
++            if (rc != randBlock.size()) {
++                return -3;      // not enough data read
++            }
++
++            return 0;
++        }
++    }
++
++    // If that failed, try /dev/random
++    // FIXME: open in noblocking mode!
++    if (QFile::exists("/dev/random")) {
++        QFile devrand("/dev/random");
++        if (devrand.open(QIODevice::ReadOnly)) {
++            int rc = 0;
++            int cnt = 0;
++
++            do {
++                int rc2 = devrand.read(randBlock.data() + rc, randBlock.size());
++
++                if (rc2 < 0) {
++                    return -3;  // read error
++                }
++
++                rc += rc2;
++                cnt++;
++                if (cnt > randBlock.size()) {
++                    return -4;  // reading forever?!
++                }
++            } while(rc < randBlock.size());
++
++            return 0;
++        }
++    }
++
++    // EGD method
++    QString randFilename = QString::fromLocal8Bit(qgetenv("RANDFILE"));
++    if (!randFilename.isEmpty()) {
++        if (QFile::exists(randFilename)) {
++            QFile devrand(randFilename);
++            if (devrand.open(QIODevice::ReadOnly)) {
++                int rc = devrand.read(randBlock.data(), randBlock.size());
++                if (rc != randBlock.size()) {
++                    return -3;      // not enough data read
++                }
++                return 0;
++            }
++        }
++    }
++
++    // Couldn't get any random data!!
++    return -1;
++
++#endif
++}
++
++
++
++static BlowfishPersistHandler *blowfishHandler =0;
++#ifdef HAVE_QGPGME
++static GpgPersistHandler *gpgHandler =0;
++#endif // HAVE_QGPGME
++
++BackendPersistHandler *BackendPersistHandler::getPersistHandler(BackendCipherType cipherType)
++{
++    switch (cipherType){
++        case BACKEND_CIPHER_BLOWFISH:
++            if (0 == blowfishHandler)
++                blowfishHandler = new BlowfishPersistHandler;
++            return blowfishHandler;
++#ifdef HAVE_QGPGME
++        case BACKEND_CIPHER_GPG:
++            if (0 == gpgHandler)
++                gpgHandler = new GpgPersistHandler;
++            return gpgHandler;
++#endif // HAVE_QGPGME
++        default:
++            Q_ASSERT(0);
++            return 0;
++    }
++}
++    
++BackendPersistHandler *BackendPersistHandler::getPersistHandler(char magicBuf[12])
++{
++    if (magicBuf[2] == KWALLET_CIPHER_BLOWFISH_CBC && 
++        magicBuf[3] == KWALLET_HASH_SHA1) {
++        if (0 == blowfishHandler)
++            blowfishHandler = new BlowfishPersistHandler;
++        return blowfishHandler;
++    }
++#ifdef HAVE_QGPGME
++    if (magicBuf[2] == KWALLET_CIPHER_GPG &&
++        magicBuf[3] == 0) {
++        if (0 == gpgHandler)
++            gpgHandler = new GpgPersistHandler;
++        return gpgHandler;
++    }
++#endif // HAVE_QGPGME
++    return 0;    // unknown cipher or hash
++}
++  
++int BlowfishPersistHandler::write(Backend* wb, KSaveFile& sf, QByteArray& version, WId)
++{
++    assert(wb->_cipherType == BACKEND_CIPHER_BLOWFISH);
++
++    version[2] = KWALLET_CIPHER_BLOWFISH_CBC;
++    version[3] = KWALLET_HASH_SHA1;
++    if (sf.write(version, 4) != 4) {
++        sf.abort();
++        return -4; // write error
++    }
++
++    // Holds the hashes we write out
++    QByteArray hashes;
++    QDataStream hashStream(&hashes, QIODevice::WriteOnly);
++    KMD5 md5;
++    hashStream << static_cast<quint32>(wb->_entries.count());
++
++    // Holds decrypted data prior to encryption
++    QByteArray decrypted;
++
++    // FIXME: we should estimate the amount of data we will write in each
++    // buffer and resize them approximately in order to avoid extra
++    // resizes.
++
++    // populate decrypted
++    QDataStream dStream(&decrypted, QIODevice::WriteOnly);
++    for (Backend::FolderMap::ConstIterator i = wb->_entries.constBegin(); i != wb->_entries.constEnd(); ++i) {
++        dStream << i.key();
++        dStream << static_cast<quint32>(i.value().count());
++
++        md5.reset();
++        md5.update(i.key().toUtf8());
++        hashStream.writeRawData(reinterpret_cast<const char*>(&(md5.rawDigest()[0])), 16);
++        hashStream << static_cast<quint32>(i.value().count());
++
++        for (Backend::EntryMap::ConstIterator j = i.value().constBegin(); j != i.value().constEnd(); ++j) {
++            dStream << j.key();
++            dStream << static_cast<qint32>(j.value()->type());
++            dStream << j.value()->value();
++
++            md5.reset();
++            md5.update(j.key().toUtf8());
++            hashStream.writeRawData(reinterpret_cast<const char*>(&(md5.rawDigest()[0])), 16);
++        }
++    }
++
++    if (sf.write(hashes, hashes.size()) != hashes.size()) {
++        sf.abort();
++        return -4; // write error
++    }
++
++    // calculate the hash of the file
++    SHA1 sha;
++    BlowFish _bf;
++    CipherBlockChain bf(&_bf);
++
++    sha.process(decrypted.data(), decrypted.size());
++
++    // prepend and append the random data
++    QByteArray wholeFile;
++    long blksz = bf.blockSize();
++    long newsize = decrypted.size() +
++               blksz            +    // encrypted block
++               4                +    // file size
++               20;      // size of the SHA hash
++
++    int delta = (blksz - (newsize % blksz));
++    newsize += delta;
++    wholeFile.resize(newsize);
++
++    QByteArray randBlock;
++    randBlock.resize(blksz+delta);
++    if (getRandomBlock(randBlock) < 0) {
++        sha.reset();
++        decrypted.fill(0);
++        sf.abort();
++        return -3;      // Fatal error: can't get random
++    }
++
++    for (int i = 0; i < blksz; i++) {
++        wholeFile[i] = randBlock[i];
++    }
++
++    for (int i = 0; i < 4; i++) {
++        wholeFile[(int)(i+blksz)] = (decrypted.size() >> 8*(3-i))&0xff;
++    }
++
++    for (int i = 0; i < decrypted.size(); i++) {
++        wholeFile[(int)(i+blksz+4)] = decrypted[i];
++    }
++
++    for (int i = 0; i < delta; i++) {
++        wholeFile[(int)(i+blksz+4+decrypted.size())] = randBlock[(int)(i+blksz)];
++    }
++
++    const char *hash = (const char *)sha.hash();
++    for (int i = 0; i < 20; i++) {
++        wholeFile[(int)(newsize - 20 + i)] = hash[i];
++    }
++
++    sha.reset();
++    decrypted.fill(0);
++
++    // encrypt the data
++    if (!bf.setKey(wb->_passhash.data(), wb->_passhash.size() * 8)) {
++        wholeFile.fill(0);
++        sf.abort();
++        return -2; // encrypt error
++    }
++
++    int rc = bf.encrypt(wholeFile.data(), wholeFile.size());
++    if (rc < 0) {
++        wholeFile.fill(0);
++        sf.abort();
++        return -2;  // encrypt error
++    }
++
++    // write the file
++    if (sf.write(wholeFile, wholeFile.size()) != wholeFile.size()) {
++        wholeFile.fill(0);
++        sf.abort();
++        return -4; // write error
++    }
++    if (!sf.finalize()) {
++        kDebug() << "WARNING: wallet sync to disk failed! KSaveFile status was " << sf.errorString();
++        wholeFile.fill(0);
++        return -4; // write error
++    }
++
++    wholeFile.fill(0);
++
++    return 0;
++}
++
++
++int BlowfishPersistHandler::read(Backend* wb, QFile& db, WId)
++{
++    wb->_cipherType = BACKEND_CIPHER_BLOWFISH;
++    wb->_hashes.clear();
++    // Read in the hashes
++    QDataStream hds(&db);
++    quint32 n;
++    hds >> n;
++    if (n > 0xffff) { // sanity check
++        return -43;
++    }
++
++    for (size_t i = 0; i < n; ++i) {
++        KMD5::Digest d, d2; // judgment day
++        MD5Digest ba;
++        QMap<MD5Digest,QList<MD5Digest> >::iterator it;
++        quint32 fsz;
++        if (hds.atEnd()) return -43;
++        hds.readRawData(reinterpret_cast<char *>(d), 16);
++        hds >> fsz;
++        ba = MD5Digest(reinterpret_cast<char *>(d));
++        it = wb->_hashes.insert(ba, QList<MD5Digest>());
++        for (size_t j = 0; j < fsz; ++j) {
++            hds.readRawData(reinterpret_cast<char *>(d2), 16);
++            ba = MD5Digest(reinterpret_cast<char *>(d2));
++            (*it).append(ba);
++        }
++    }
++
++    // Read in the rest of the file.
++    QByteArray encrypted = db.readAll();
++    assert(encrypted.size() < db.size());
++
++    BlowFish _bf;
++    CipherBlockChain bf(&_bf);
++    int blksz = bf.blockSize();
++    if ((encrypted.size() % blksz) != 0) {
++        return -5;     // invalid file structure
++    }
++
++    bf.setKey((void *)wb->_passhash.data(), wb->_passhash.size()*8);
++
++    if (!encrypted.data()) {
++        wb->_passhash.fill(0);
++        encrypted.fill(0);
++        return -7; // file structure error
++    }
++
++    int rc = bf.decrypt(encrypted.data(), encrypted.size());
++    if (rc < 0) {
++        wb->_passhash.fill(0);
++        encrypted.fill(0);
++        return -6;  // decrypt error
++    }
++
++    const char *t = encrypted.data();
++
++    // strip the leading data
++    t += blksz;    // one block of random data
++
++    // strip the file size off
++    long fsize = 0;
++
++    fsize |= (long(*t) << 24) & 0xff000000;
++    t++;
++    fsize |= (long(*t) << 16) & 0x00ff0000;
++    t++;
++    fsize |= (long(*t) <<  8) & 0x0000ff00;
++    t++;
++    fsize |= long(*t) & 0x000000ff;
++    t++;
++
++    if (fsize < 0 || fsize > long(encrypted.size()) - blksz - 4) {
++        //kDebug() << "fsize: " << fsize << " encrypted.size(): " << encrypted.size() << " blksz: " << blksz;
++        encrypted.fill(0);
++        return -9;         // file structure error.
++    }
++
++    // compute the hash ourself
++    SHA1 sha;
++    sha.process(t, fsize);
++    const char *testhash = (const char *)sha.hash();
++
++    // compare hashes
++    int sz = encrypted.size();
++    for (int i = 0; i < 20; i++) {
++        if (testhash[i] != encrypted[sz - 20 + i]) {
++            encrypted.fill(0);
++            sha.reset();
++            return -8;         // hash error.
++        }
++    }
++
++    sha.reset();
++
++    // chop off the leading blksz+4 bytes
++    QByteArray tmpenc(encrypted.data()+blksz+4, fsize);
++    encrypted = tmpenc;
++    tmpenc.fill(0);
++
++    // Load the data structures up
++    QDataStream eStream(encrypted);
++
++    while (!eStream.atEnd()) {
++        QString folder;
++        quint32 n;
++
++        eStream >> folder;
++        eStream >> n;
++
++        // Force initialisation
++        wb->_entries[folder].clear();
++
++        for (size_t i = 0; i < n; ++i) {
++            QString key;
++            KWallet::Wallet::EntryType et = KWallet::Wallet::Unknown;
++            Entry *e = new Entry;
++            eStream >> key;
++            qint32 x = 0; // necessary to read properly
++            eStream >> x;
++            et = static_cast<KWallet::Wallet::EntryType>(x);
++
++            switch (et) {
++            case KWallet::Wallet::Password:
++            case KWallet::Wallet::Stream:
++            case KWallet::Wallet::Map:
++            break;
++            default: // Unknown entry
++                delete e;
++                continue;
++            }
++
++            QByteArray a;
++            eStream >> a;
++            e->setValue(a);
++            e->setType(et);
++            e->setKey(key);
++            wb->_entries[folder][key] = e;
++        }
++    }
++
++    wb->_open = true;
++    encrypted.fill(0);
++    return 0;
++}
++
++#ifdef HAVE_QGPGME
++GpgME::Error initGpgME()
++{
++    GpgME::Error err;
++    static bool alreadyInitialized = false;
++    if (!alreadyInitialized) {
++        GpgME::initializeLibrary();
++        err = GpgME::checkEngine(GpgME::OpenPGP);
++        if (err){
++            kDebug() << "OpenPGP not supported!";
++        }
++        alreadyInitialized = true;
++    }
++    return err;
++}
++
++int GpgPersistHandler::write(Backend* wb, KSaveFile& sf, QByteArray& version, WId w)
++{
++    version[2] = KWALLET_CIPHER_GPG;
++    version[3] = 0;
++    if (sf.write(version, 4) != 4) {
++        sf.abort();
++        return -4; // write error
++    }
++
++    GpgME::Error err = initGpgME();
++    if (err) {
++        kDebug() << "initGpgME returned " << err.code();
++        KMessageBox::errorWId( w, i18n("<qt>Error when attempting to initialize OpenPGP while attempting to save the wallet <b>%1</b>. Error code is <b>%2</b>. Please fix your system configuration, then try again!</qt>", Qt::escape(wb->_name), err.code()));
++        sf.abort();
++        return -5;
++    }
++    
++    boost::shared_ptr< GpgME::Context > ctx( GpgME::Context::createForProtocol(GpgME::OpenPGP) );
++    if (0 == ctx) {
++        kDebug() << "Cannot setup OpenPGP context!";
++        KMessageBox::errorWId(w, i18n("<qt>Error when attempting to initialize OpenPGP while attempting to save the wallet <b>%1</b>. Please fix your system configuration, then try again!</qt>"), Qt::escape(wb->_name));
++        return -6;
++    }
++
++    assert(wb->_cipherType == BACKEND_CIPHER_GPG);
++    
++    QByteArray hashes;
++    QDataStream hashStream(&hashes, QIODevice::WriteOnly);
++    KMD5 md5;
++    hashStream << static_cast<quint32>(wb->_entries.count());
++
++    QByteArray values;
++    QDataStream valueStream(&values, QIODevice::WriteOnly);
++    Backend::FolderMap::ConstIterator i = wb->_entries.constBegin();
++    Backend::FolderMap::ConstIterator ie = wb->_entries.constEnd();
++    for ( ; i != ie; ++i) {
++        valueStream << i.key();
++        valueStream << static_cast<quint32>(i.value().count());
++
++        md5.reset();
++        md5.update(i.key().toUtf8());
++        hashStream.writeRawData(reinterpret_cast<const char*>(&(md5.rawDigest()[0])), 16);
++        hashStream << static_cast<quint32>(i.value().count());
++
++        Backend::EntryMap::ConstIterator j = i.value().constBegin();
++        Backend::EntryMap::ConstIterator je = i.value().constEnd();
++        for (; j != je; ++j) {
++            valueStream << j.key();
++            valueStream << static_cast<qint32>(j.value()->type());
++            valueStream << j.value()->value();
++
++            md5.reset();
++            md5.update(j.key().toUtf8());
++            hashStream.writeRawData(reinterpret_cast<const char*>(&(md5.rawDigest()[0])), 16);
++        }
++    }
++
++    QByteArray dataBuffer;
++    QDataStream dataStream(&dataBuffer, QIODevice::WriteOnly);
++    QString keyID(wb->_gpgKey.keyID());
++    dataStream << keyID;
++    dataStream << hashes;
++    dataStream << values;
++    
++    GpgME::Data decryptedData(dataBuffer.data(), dataBuffer.size(), false);
++    GpgME::Data encryptedData;
++    std::vector< GpgME::Key > keys;
++    keys.push_back(wb->_gpgKey);
++    GpgME::EncryptionResult res = ctx->encrypt(keys, decryptedData, encryptedData, GpgME::Context::None);
++    if (res.error()){
++        int gpgerr = res.error().code();
++        KMessageBox::errorWId( w, i18n("<qt>Encryption error while attempting to save the wallet <b>%1</b>. Error code is <b>%2 (%3)</b>. Please fix your system configuration, then try again!</qt>",
++                                       Qt::escape(wb->_name), gpgerr, gpgme_strerror(gpgerr)));
++        kDebug() << "GpgME encryption error: " << res.error().code();
++        sf.abort();
++        return -7;
++    }
++
++    char buffer[4096];
++    ssize_t bytes =0;
++    encryptedData.seek(0, SEEK_SET);
++    while (bytes = encryptedData.read(buffer, sizeof(buffer)/sizeof(buffer[0]))){
++        if (sf.write(buffer, bytes) != bytes){
++            KMessageBox::errorWId( w, i18n("<qt>File handling error while attempting to save the wallet <b>%1</b>. Error was <b>%2</b>. Please fix your system configuration, then try again!</qt>", Qt::escape(wb->_name), sf.errorString()));
++            sf.abort();
++            return -4; // write error
++        }
++    }
++    
++    return 0;
++}
++
++int GpgPersistHandler::read(Backend* wb, QFile& sf, WId w)
++{
++    GpgME::Error err = initGpgME();
++    if (err){
++        KMessageBox::errorWId( w, i18n("<qt>Error when attempting to initialize OpenPGP while attempting to open the wallet <b>%1</b>. Error code is <b>%2</b>. Please fix your system configuration, then try again!</qt>", Qt::escape(wb->_name), err.code()));
++        return -1;
++    }
++
++    wb->_cipherType = BACKEND_CIPHER_GPG;
++    wb->_hashes.clear();
++
++    // the remainder of the file is GPG encrypted. Let's decrypt it
++    GpgME::Data encryptedData;
++    char buffer[4096];
++    ssize_t bytes = 0;
++    while (bytes = sf.read(buffer, sizeof(buffer)/sizeof(buffer[0]))){
++        encryptedData.write(buffer, bytes);
++    }
++    
++  retry_label:
++    boost::shared_ptr< GpgME::Context > ctx( GpgME::Context::createForProtocol(GpgME::OpenPGP) );
++    if (0 == ctx) {
++        KMessageBox::errorWId(w, i18n("<qt>Error when attempting to initialize OpenPGP while attempting to open the wallet <b>%1</b>. Please fix your system configuration, then try again!</qt>", Qt::escape(wb->_name)));
++        kDebug() << "Cannot setup OpenPGP context!";
++        return -1;
++    }
++
++    GpgME::Data decryptedData;
++    encryptedData.seek(0, SEEK_SET);
++    GpgME::DecryptionResult res = ctx->decrypt(encryptedData, decryptedData);
++    if (res.error()){
++        kDebug() << "Error decrypting message: " << res.error().asString() << ", code " << res.error().code() << ", source " << res.error().source();
++        KGuiItem btnRetry(i18n("Retry"));
++        // FIXME the logic here should be a little more elaborate; a dialog box should be used with "retry", "cancel", but also "troubleshoot" with options to show card status and to kill scdaemon
++        int userChoice = KMessageBox::warningYesNoWId(w, i18n("<qt>Error when attempting to decrypt the wallet <b>%1</b> using GPG. If you're using a SmartCard, please ensure it's inserted then try again.<br><br>GPG error was <b>%2</b></qt>", Qt::escape(wb->_name), res.error().asString()),
++            i18n("kwalletd GPG backend"), btnRetry, KStandardGuiItem::cancel());
++        if (userChoice == KMessageBox::Yes) {
++            decryptedData.seek(0, SEEK_SET);
++            goto retry_label;
++        }
++        return -1;
++    }
++    
++    decryptedData.seek(0, SEEK_SET);
++    QByteArray dataBuffer;
++    while (bytes = decryptedData.read(buffer, sizeof(buffer)/sizeof(buffer[0]))){
++        dataBuffer.append(buffer, bytes);
++    }
++    
++    // load the wallet from the decrypted data
++    QDataStream dataStream(dataBuffer);
++    QString keyID;
++    QByteArray hashes;
++    QByteArray values;
++    dataStream >> keyID;
++    dataStream >> hashes;
++    dataStream >> values;
++
++    // locate the GPG key having the ID found inside the file. This will be needed later, when writing changes to disk.
++    QDataStream fileStream(&sf);
++    fileStream.unsetDevice();
++    kDebug() << "This wallet was encrypted using GPG key with ID " << keyID;
++
++    ctx->setKeyListMode(GPGME_KEYLIST_MODE_LOCAL);
++    std::vector< GpgME::Key > keys;
++    int row =0;
++    err = ctx->startKeyListing();
++    while (!err) {
++        GpgME::Key k = ctx->nextKey(err);
++        if (err)
++            break;
++        if (keyID == k.keyID()){
++            kDebug() << "The key was found.";
++            wb->_gpgKey = k;
++            break;
++        }
++    }
++    ctx->endKeyListing();
++    if (wb->_gpgKey.isNull()){
++        KMessageBox::errorWId(w, i18n("<qt>Error when attempting to open the wallet <b>%1</b>. The wallet was encrypted using the GPG Key ID <b>%2</b> but this key was not found on your system.</qt>", Qt::escape(wb->_name), keyID));
++        return -1;
++    }
++
++    
++    QDataStream hashStream(hashes);
++    QDataStream valueStream(values);
++    
++    quint32 hashCount;
++    hashStream >> hashCount;
++    if (hashCount > 0xFFFF) {
++        return -43;
++    }
++
++    quint32 folderCount = hashCount;
++    while (hashCount--){
++        KMD5::Digest d;
++        hashStream.readRawData(reinterpret_cast<char *>(d), 16);
++        
++        quint32 folderSize;
++        hashStream >> folderSize;
++        
++        MD5Digest ba = MD5Digest(reinterpret_cast<char *>(d));
++        QMap<MD5Digest, QList<MD5Digest> >::iterator it = wb->_hashes.insert(ba, QList<MD5Digest>());
++        while (folderSize--){
++            KMD5::Digest d2;
++            hashStream.readRawData(reinterpret_cast<char *>(d2), 16);
++            ba = MD5Digest(reinterpret_cast<char *>(d2));
++            (*it).append(ba);
++        }
++    }
++    
++    while (folderCount--){
++        QString folder;
++        valueStream >> folder;
++        
++        quint32 entryCount;
++        valueStream >> entryCount;
++        
++        wb->_entries[folder].clear();
++        
++        while (entryCount--){
++            KWallet::Wallet::EntryType et = KWallet::Wallet::Unknown;
++            Entry *e = new Entry;
++            
++            QString key;
++            valueStream >> key;
++            
++            qint32 x =0; // necessary to read properly
++            valueStream >> x;
++            et = static_cast<KWallet::Wallet::EntryType>(x);
++            
++            switch (et) {
++            case KWallet::Wallet::Password:
++            case KWallet::Wallet::Stream:
++            case KWallet::Wallet::Map:
++            break;
++            default: // Unknown entry
++                delete e;
++                continue;
++            }
++            
++            QByteArray a;
++            valueStream >> a;
++            e->setValue(a);
++            e->setType(et);
++            e->setKey(key);
++            wb->_entries[folder][key] = e;
++        }
++    }
++    
++    wb->_open = true;
++
++    return 0;
++}
++#endif // HAVE_QGPGME
++
++} // namespace
+diff -Nur kwalletd.than/backend/backendpersisthandler.h kwalletd/backend/backendpersisthandler.h
+--- kwalletd.than/backend/backendpersisthandler.h	1970-01-01 01:00:00.000000000 +0100
++++ kwalletd/backend/backendpersisthandler.h	2014-02-26 09:34:12.000000000 +0100
+@@ -0,0 +1,83 @@
++/**
++  * This file is part of the KDE project
++  * Copyright (C) 2013 Valentin Rusu <kde@rusu.info>
++  *
++  * This library is free software; you can redistribute it and/or
++  * modify it under the terms of the GNU Library General Public
++  * License version 2 as published by the Free Software Foundation.
++  *
++  * This library is distributed in the hope that it will be useful,
++  * but WITHOUT ANY WARRANTY; without even the implied warranty of
++  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  * Library General Public License for more details.
++  *
++  * You should have received a copy of the GNU Library General Public License
++  * along with this library; see the file COPYING.LIB.  If not, write to
++  * the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
++  * Boston, MA 02110-1301, USA.
++  */
++#ifndef BACKENDPERSISTHANDLER_H
++#define BACKENDPERSISTHANDLER_H
++
++#define KWMAGIC_LEN 12
++
++#include <qwindowdefs.h>
++
++class QFile;
++class KSaveFile;
++namespace KWallet {
++
++class Backend;
++
++enum BackendCipherType {
++    BACKEND_CIPHER_UNKNOWN,  /// this is used by freshly allocated wallets
++    BACKEND_CIPHER_BLOWFISH, /// use the legacy blowfish cipher type
++#ifdef HAVE_QGPGME
++    BACKEND_CIPHER_GPG       /// use GPG backend to encrypt wallet contents
++#endif // HAVE_QGPGME
++};
++        
++
++class BackendPersistHandler {
++protected:
++    BackendPersistHandler() {}
++public:
++    virtual ~BackendPersistHandler() {}
++    /**
++     * This is a factory method used to get an instance of the backend suitable
++     * for reading/writing using the given cipher type
++     * 
++     * @param cypherType indication of the backend that should be returned
++     * @return a pointer to an instance of the requested handler type. No need to delete this pointer, it's lifetime is taken care of by this factory
++     */
++    static BackendPersistHandler *getPersistHandler(BackendCipherType cipherType);
++    static BackendPersistHandler *getPersistHandler(char magicBuf[KWMAGIC_LEN]);
++    
++    virtual int write(Backend* wb, KSaveFile& sf, QByteArray& version, WId w) =0;
++    virtual int read(Backend* wb, QFile& sf, WId w) =0;
++};
++
++
++class BlowfishPersistHandler : public BackendPersistHandler {
++public:
++    BlowfishPersistHandler() {}
++    virtual ~BlowfishPersistHandler() {}
++    
++    virtual int write(Backend* wb, KSaveFile& sf, QByteArray& version, WId w);
++    virtual int read(Backend* wb, QFile& sf, WId w);
++};
++
++#ifdef HAVE_QGPGME
++class GpgPersistHandler : public BackendPersistHandler {
++public:
++    GpgPersistHandler() {}
++    virtual ~GpgPersistHandler() {}
++    
++    virtual int write(Backend* wb, KSaveFile& sf, QByteArray& version, WId w);
++    virtual int read(Backend* wb, QFile& sf, WId w);
++};
++#endif // HAVE_QGPGME
++
++} // namespace
++
++#endif // BACKENDPERSISTHANDLER_H
+diff -Nur kwalletd.than/backend/CMakeLists.txt kwalletd/backend/CMakeLists.txt
+--- kwalletd.than/backend/CMakeLists.txt	2013-06-28 19:12:33.338802909 +0200
++++ kwalletd/backend/CMakeLists.txt	2014-02-26 09:34:12.000000000 +0100
+@@ -2,6 +2,9 @@
+ 
+ check_include_files(stdint.h HAVE_STDINT_H)
+ check_include_files(sys/bitypes.h HAVE_SYS_BITYPES_H)
++if (QGPGME_FOUND)
++    add_definitions(-DHAVE_QGPGME)
++endif(QGPGME_FOUND)
+ 
+ configure_file (config-kwalletbackend.h.cmake ${CMAKE_CURRENT_BINARY_DIR}/config-kwalletbackend.h )
+ 
+@@ -14,11 +17,15 @@
+    sha1.cc
+    kwalletentry.cc
+    kwalletbackend.cc
++   backendpersisthandler.cpp
+ )
+ 
+ kde4_add_library(kwalletbackend SHARED ${kwalletbackend_LIB_SRCS})
+ 
+ target_link_libraries(kwalletbackend ${KDE4_KDEUI_LIBS} )
++if(QGPGME_FOUND)
++target_link_libraries(kwalletbackend ${QGPGME_LIBRARIES} )
++endif(QGPGME_FOUND)
+ 
+ # link with advapi32 on windows
+ if(WIN32 AND NOT WINCE)
+diff -Nur kwalletd.than/backend/kwalletbackend.cc kwalletd/backend/kwalletbackend.cc
+--- kwalletd.than/backend/kwalletbackend.cc	2013-06-28 19:12:33.339802869 +0200
++++ kwalletd/backend/kwalletbackend.cc	2014-02-26 09:34:12.000000000 +0100
+@@ -28,6 +28,10 @@
+ #include <kcodecs.h>
+ #include <ksavefile.h>
+ #include <kstandarddirs.h>
++#ifdef HAVE_QGPGME
++#include <gpgme++/key.h>
++#endif
++#include <knotification.h>
+ 
+ #include <QtCore/QFile>
+ #include <QtCore/QFileInfo>
+@@ -48,17 +52,10 @@
+ #define KWALLET_VERSION_MAJOR		0
+ #define KWALLET_VERSION_MINOR		0
+ 
+-#define KWALLET_CIPHER_BLOWFISH_CBC	0
+-#define KWALLET_CIPHER_3DES_CBC		1 // unsupported
+-
+-#define KWALLET_HASH_SHA1		0
+-#define KWALLET_HASH_MD5		1 // unsupported
+-
+ 
+ using namespace KWallet;
+ 
+ #define KWMAGIC "KWALLET\n\r\0\r\n"
+-#define KWMAGIC_LEN 12
+ 
+ class Backend::BackendPrivate
+ {
+@@ -69,7 +66,7 @@
+     KGlobal::dirs()->addResourceType("kwallet", 0, "share/apps/kwallet");
+ }
+ 
+-Backend::Backend(const QString& name, bool isPath) : d(0), _name(name), _ref(0) {
++Backend::Backend(const QString& name, bool isPath) : d(0), _name(name), _ref(0), _cipherType(KWallet::BACKEND_CIPHER_UNKNOWN) {
+ 	initKWalletDir();
+ 	if (isPath) {
+ 		_path = name;
+@@ -88,91 +85,13 @@
+ 	delete d;
+ }
+ 
+-static int getRandomBlock(QByteArray& randBlock) {
+-
+-#ifdef Q_OS_WIN //krazy:exclude=cpp
+-
+-	// Use windows crypto API to get randomness on win32
+-	// HACK: this should be done using qca
+-	HCRYPTPROV hProv;
+-
+-	if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL,
+-	    CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) return -1; // couldn't get random data
+-
+-	if (!CryptGenRandom(hProv, static_cast<DWORD>(randBlock.size()),
+-	    (BYTE*)randBlock.data())) {
+-		return -3; // read error
+-	}
+-
+-	// release the crypto context
+-	CryptReleaseContext(hProv, 0);
+-
+-	return randBlock.size();
+-
+-#else
+-
+-	// First try /dev/urandom
+-	if (QFile::exists("/dev/urandom")) {
+-		QFile devrand("/dev/urandom");
+-		if (devrand.open(QIODevice::ReadOnly)) {
+-			int rc = devrand.read(randBlock.data(), randBlock.size());
+-
+-			if (rc != randBlock.size()) {
+-				return -3;		// not enough data read
+-			}
+-
+-			return 0;
+-		}
+-	}
+-
+-	// If that failed, try /dev/random
+-	// FIXME: open in noblocking mode!
+-	if (QFile::exists("/dev/random")) {
+-		QFile devrand("/dev/random");
+-		if (devrand.open(QIODevice::ReadOnly)) {
+-			int rc = 0;
+-			int cnt = 0;
+-
+-			do {
+-				int rc2 = devrand.read(randBlock.data() + rc, randBlock.size());
+-
+-				if (rc2 < 0) {
+-					return -3;	// read error
+-				}
+-
+-				rc += rc2;
+-				cnt++;
+-				if (cnt > randBlock.size()) {
+-					return -4;	// reading forever?!
+-				}
+-			} while(rc < randBlock.size());
+-
+-			return 0;
+-		}
+-	}
+-
+-	// EGD method
+-	QString randFilename = QString::fromLocal8Bit(qgetenv("RANDFILE"));
+-	if (!randFilename.isEmpty()) {
+-		if (QFile::exists(randFilename)) {
+-			QFile devrand(randFilename);
+-			if (devrand.open(QIODevice::ReadOnly)) {
+-				int rc = devrand.read(randBlock.data(), randBlock.size());
+-				if (rc != randBlock.size()) {
+-					return -3;      // not enough data read
+-				}
+-				return 0;
+-			}
+-		}
+-	}
+-
+-	// Couldn't get any random data!!
+-	return -1;
+-
+-#endif
++void Backend::setCipherType(BackendCipherType ct)
++{
++    // changing cipher type on already initialed wallets is not permitted
++    assert(_cipherType == KWallet::BACKEND_CIPHER_UNKNOWN);
++    _cipherType = ct;
+ }
+ 
+-
+ // this should be SHA-512 for release probably
+ static int password2hash(const QByteArray& password, QByteArray& hash) {
+ 	SHA1 sha;
+@@ -309,15 +228,26 @@
+ }
+ 
+ 
+-int Backend::open(const QByteArray& password) {
++int Backend::open(const QByteArray& password, WId w) {
+ 	if (_open) {
+ 		return -255;  // already open
+ 	}
+ 	
+ 	setPassword(password);
+-   return openInternal();
++   return openInternal(w);
+ }
+ 
++#ifdef HAVE_QGPGME
++int Backend::open(const GpgME::Key& key)
++{
++    if (_open) {
++        return -255;  // already open
++    }
++    _gpgKey = key;
++    return openInternal();
++}
++#endif // HAVE_QGPGME
++
+ int Backend::openPreHashed(const QByteArray &passwordHash)
+ {
+    if (_open) {
+@@ -334,7 +264,7 @@
+    return openInternal();
+ }
+  
+-int Backend::openInternal()
++int Backend::openInternal(WId w)
+ {
+ 	// No wallet existed.  Let's create it.
+ 	// Note: 60 bytes is presently the minimum size of a wallet file.
+@@ -346,8 +276,11 @@
+ 		}
+ 		newfile.close();
+ 		_open = true;
+-		sync();
+-		return 1;          // new file opened, but OK
++		if (sync(w)) {
++            return -2;
++        } else {
++            return 1;          // new file opened, but OK
++        }
+ 	}
+ 
+ 	QFile db(_path);
+@@ -373,159 +306,15 @@
+ 		return -4;	   // unknown version
+ 	}
+ 
+-	if (magicBuf[2] != KWALLET_CIPHER_BLOWFISH_CBC) {
+-		return -42;	   // unknown cipher
+-	}
+-
+-	if (magicBuf[3] != KWALLET_HASH_SHA1) {
+-		return -42;	   // unknown hash
+-	}
+-
+-	_hashes.clear();
+-	// Read in the hashes
+-	QDataStream hds(&db);
+-	quint32 n;
+-	hds >> n;
+-	if (n > 0xffff) { // sanity check
+-		return -43;
+-	}
+-
+-	for (size_t i = 0; i < n; ++i) {
+-		KMD5::Digest d, d2; // judgment day
+-		MD5Digest ba;
+-		QMap<MD5Digest,QList<MD5Digest> >::iterator it;
+-		quint32 fsz;
+-		if (hds.atEnd()) return -43;
+-		hds.readRawData(reinterpret_cast<char *>(d), 16);
+-		hds >> fsz;
+-		ba = MD5Digest(reinterpret_cast<char *>(d));
+-		it = _hashes.insert(ba, QList<MD5Digest>());
+-		for (size_t j = 0; j < fsz; ++j) {
+-			hds.readRawData(reinterpret_cast<char *>(d2), 16);
+-			ba = MD5Digest(reinterpret_cast<char *>(d2));
+-			(*it).append(ba);
+-		}
+-	}
+-
+-	// Read in the rest of the file.
+-	QByteArray encrypted = db.readAll();
+-	assert(encrypted.size() < db.size());
+-
+-	BlowFish _bf;
+-	CipherBlockChain bf(&_bf);
+-	int blksz = bf.blockSize();
+-	if ((encrypted.size() % blksz) != 0) {
+-		return -5;	   // invalid file structure
+-	}
+-
+-	bf.setKey((void *)_passhash.data(), _passhash.size()*8);
+-
+-	if (!encrypted.data()) {
+-		_passhash.fill(0);
+-		encrypted.fill(0);
+-		return -7; // file structure error
+-	}
+-
+-	int rc = bf.decrypt(encrypted.data(), encrypted.size());
+-	if (rc < 0) {
+-		_passhash.fill(0);
+-		encrypted.fill(0);
+-		return -6;	// decrypt error
+-	}
+-
+-	const char *t = encrypted.data();
+-
+-	// strip the leading data
+-	t += blksz;    // one block of random data
+-
+-	// strip the file size off
+-	long fsize = 0;
+-
+-	fsize |= (long(*t) << 24) & 0xff000000;
+-	t++;
+-	fsize |= (long(*t) << 16) & 0x00ff0000;
+-	t++;
+-	fsize |= (long(*t) <<  8) & 0x0000ff00;
+-	t++;
+-	fsize |= long(*t) & 0x000000ff;
+-	t++;
+-
+-	if (fsize < 0 || fsize > long(encrypted.size()) - blksz - 4) {
+-		//kDebug() << "fsize: " << fsize << " encrypted.size(): " << encrypted.size() << " blksz: " << blksz;
+-		encrypted.fill(0);
+-		return -9;         // file structure error.
+-	}
+-
+-	// compute the hash ourself
+-	SHA1 sha;
+-	sha.process(t, fsize);
+-	const char *testhash = (const char *)sha.hash();
+-
+-	// compare hashes
+-	int sz = encrypted.size();
+-	for (int i = 0; i < 20; i++) {
+-		if (testhash[i] != encrypted[sz - 20 + i]) {
+-			encrypted.fill(0);
+-			sha.reset();
+-			return -8;         // hash error.
+-		}
+-	}
+-
+-	sha.reset();
+-
+-	// chop off the leading blksz+4 bytes
+-	QByteArray tmpenc(encrypted.data()+blksz+4, fsize);
+-	encrypted = tmpenc;
+-	tmpenc.fill(0);
+-
+-	// Load the data structures up
+-	QDataStream eStream(encrypted);
+-
+-	while (!eStream.atEnd()) {
+-		QString folder;
+-		quint32 n;
+-
+-		eStream >> folder;
+-		eStream >> n;
+-
+-		// Force initialisation
+-		_entries[folder].clear();
+-
+-		for (size_t i = 0; i < n; ++i) {
+-			QString key;
+-			KWallet::Wallet::EntryType et = KWallet::Wallet::Unknown;
+-			Entry *e = new Entry;
+-			eStream >> key;
+-			qint32 x = 0; // necessary to read properly
+-			eStream >> x;
+-			et = static_cast<KWallet::Wallet::EntryType>(x);
+-
+-			switch (et) {
+-			case KWallet::Wallet::Password:
+-			case KWallet::Wallet::Stream:
+-			case KWallet::Wallet::Map:
+-			break;
+-			default: // Unknown entry
+-				delete e;
+-				continue;
+-			}
+-
+-			QByteArray a;
+-		 	eStream >> a;
+-			e->setValue(a);
+-			e->setType(et);
+-			e->setKey(key);
+-			_entries[folder][key] = e;
+-		}
+-	}
+-
+-	_open = true;
+-	encrypted.fill(0);
+-	return 0;
++	BackendPersistHandler *phandler = BackendPersistHandler::getPersistHandler(magicBuf);
++    if (0 == phandler){
++        return 42; // unknown cipher or hash
++    }
++    return phandler->read(this, db, w);
+ }
+ 
+ 
+-int Backend::sync() {
++int Backend::sync(WId w) {
+ 	if (!_open) {
+ 		return -255;  // not open yet
+ 	}
+@@ -546,140 +335,27 @@
+ 	QByteArray version(4, 0);
+ 	version[0] = KWALLET_VERSION_MAJOR;
+ 	version[1] = KWALLET_VERSION_MINOR;
+-	version[2] = KWALLET_CIPHER_BLOWFISH_CBC;
+-	version[3] = KWALLET_HASH_SHA1;
+-	if (sf.write(version, 4) != 4) {
+-		sf.abort();
+-		return -4; // write error
+-	}
+-
+-	// Holds the hashes we write out
+-	QByteArray hashes;
+-	QDataStream hashStream(&hashes, QIODevice::WriteOnly);
+-	KMD5 md5;
+-	hashStream << static_cast<quint32>(_entries.count());
+-
+-	// Holds decrypted data prior to encryption
+-	QByteArray decrypted;
+-
+-	// FIXME: we should estimate the amount of data we will write in each
+-	// buffer and resize them approximately in order to avoid extra
+-	// resizes.
+-
+-	// populate decrypted
+-	QDataStream dStream(&decrypted, QIODevice::WriteOnly);
+-	for (FolderMap::ConstIterator i = _entries.constBegin(); i != _entries.constEnd(); ++i) {
+-		dStream << i.key();
+-		dStream << static_cast<quint32>(i.value().count());
+-
+-		md5.reset();
+-		md5.update(i.key().toUtf8());
+-		hashStream.writeRawData(reinterpret_cast<const char*>(&(md5.rawDigest()[0])), 16);
+-		hashStream << static_cast<quint32>(i.value().count());
+-
+-		for (EntryMap::ConstIterator j = i.value().constBegin(); j != i.value().constEnd(); ++j) {
+-			dStream << j.key();
+-			dStream << static_cast<qint32>(j.value()->type());
+-			dStream << j.value()->value();
+-
+-			md5.reset();
+-			md5.update(j.key().toUtf8());
+-			hashStream.writeRawData(reinterpret_cast<const char*>(&(md5.rawDigest()[0])), 16);
+-		}
+-	}
+-
+-	if (sf.write(hashes, hashes.size()) != hashes.size()) {
+-		sf.abort();
+-		return -4; // write error
+-	}
+-
+-	// calculate the hash of the file
+-	SHA1 sha;
+-	BlowFish _bf;
+-	CipherBlockChain bf(&_bf);
+ 
+-	sha.process(decrypted.data(), decrypted.size());
+-
+-	// prepend and append the random data
+-	QByteArray wholeFile;
+-	long blksz = bf.blockSize();
+-	long newsize = decrypted.size() +
+-		       blksz            +    // encrypted block
+-		       4                +    // file size
+-		       20;      // size of the SHA hash
+-
+-	int delta = (blksz - (newsize % blksz));
+-	newsize += delta;
+-	wholeFile.resize(newsize);
+-
+-	QByteArray randBlock;
+-	randBlock.resize(blksz+delta);
+-	if (getRandomBlock(randBlock) < 0) {
+-		sha.reset();
+-		decrypted.fill(0);
+-		sf.abort();
+-		return -3;		// Fatal error: can't get random
+-	}
+-
+-	for (int i = 0; i < blksz; i++) {
+-		wholeFile[i] = randBlock[i];
+-	}
+-
+-	for (int i = 0; i < 4; i++) {
+-		wholeFile[(int)(i+blksz)] = (decrypted.size() >> 8*(3-i))&0xff;
+-	}
+-
+-	for (int i = 0; i < decrypted.size(); i++) {
+-		wholeFile[(int)(i+blksz+4)] = decrypted[i];
+-	}
+-
+-	for (int i = 0; i < delta; i++) {
+-		wholeFile[(int)(i+blksz+4+decrypted.size())] = randBlock[(int)(i+blksz)];
+-	}
+-
+-	const char *hash = (const char *)sha.hash();
+-	for (int i = 0; i < 20; i++) {
+-		wholeFile[(int)(newsize - 20 + i)] = hash[i];
+-	}
+-
+-	sha.reset();
+-	decrypted.fill(0);
+-
+-	// encrypt the data
+-	if (!bf.setKey(_passhash.data(), _passhash.size() * 8)) {
+-		wholeFile.fill(0);
+-		sf.abort();
+-		return -2; // encrypt error
+-	}
+-
+-	int rc = bf.encrypt(wholeFile.data(), wholeFile.size());
+-	if (rc < 0) {
+-		wholeFile.fill(0);
+-		sf.abort();
+-		return -2;	// encrypt error
+-	}
+-
+-	// write the file
+-	if (sf.write(wholeFile, wholeFile.size()) != wholeFile.size()) {
+-		wholeFile.fill(0);
+-		sf.abort();
+-		return -4; // write error
+-	}
+-	if (!sf.finalize()) {
+-		wholeFile.fill(0);
+-		return -4; // write error
+-	}
+-
+-	wholeFile.fill(0);
+-
+-	return 0;
++    BackendPersistHandler *phandler = BackendPersistHandler::getPersistHandler(_cipherType);
++    if (0 == phandler) {
++        return -4; // write error
++    }
++    int rc = phandler->write(this, sf, version, w);
++    if (rc<0) {
++        // Oops! wallet file sync filed! Display a notification about that
++        // TODO: change kwalletd status flags, when status flags will be implemented
++        KNotification *notification = new KNotification( "syncFailed" );
++        notification->setText( i18n("Failed to sync wallet <b>%1</b> to disk. Error codes are:\nRC <b>%2</b>\nSF <b>%3</b>. Please file a BUG report using this information to bugs.kde.org").arg(_name).arg(rc).arg(sf.errorString()) );
++        notification->sendEvent();
++    }
++    return rc;
+ }
+ 
+ 
+ int Backend::close(bool save) {
+ 	// save if requested
+ 	if (save) {
+-		int rc = sync();
++		int rc = sync(0);
+ 		if (rc != 0) {
+ 			return rc;
+ 		}
+@@ -902,3 +578,8 @@
+ 	password2hash(password, _passhash);
+ }
+ 
++#ifdef HAVE_QGPGME
++const GpgME::Key &Backend::gpgKey() const {
++    return _gpgKey;
++}
++#endif
+diff -Nur kwalletd.than/backend/kwalletbackend.h kwalletd/backend/kwalletbackend.h
+--- kwalletd.than/backend/kwalletbackend.h	2013-06-28 19:12:33.339802869 +0200
++++ kwalletd/backend/kwalletbackend.h	2014-02-26 09:34:12.000000000 +0100
+@@ -28,7 +28,11 @@
+ #include <QtCore/QStringList>
+ #include <QtCore/QMap>
+ #include "kwalletentry.h"
++#include "backendpersisthandler.h"
+ 
++#ifdef HAVE_QGPGME
++#include <gpgme++/key.h>
++#endif // HAVE_QGPGME
+ 
+ namespace KWallet {
+ 
+@@ -70,7 +74,10 @@
+ 		// Open and unlock the wallet.
+ 		// If opening succeeds, the password's hash will be remembered.
+ 		// If opening fails, the password's hash will be cleared.
+-		int open(const QByteArray& password);
++		int open(const QByteArray& password, WId w=0);
++#ifdef HAVE_QGPGME
++        int open(const GpgME::Key& key);
++#endif
+       
+       // Open and unlock the wallet using a pre-hashed password.
+       // If opening succeeds, the password's hash will be remembered.
+@@ -82,7 +89,7 @@
+ 		int close(bool save = false);
+ 
+ 		// Write the wallet to disk
+-		int sync();
++		int sync(WId w);
+ 
+ 		// Returns true if the current wallet is open.
+ 		bool isOpen() const;
+@@ -148,6 +155,12 @@
+ 
+ 		static QString openRCToString(int rc);
+ 
++        void setCipherType(BackendCipherType ct);
++        BackendCipherType cipherType() const { return _cipherType; }
++#ifdef HAVE_QGPGME
++        const GpgME::Key &gpgKey() const;
++#endif
++
+ 	private:
+ 		Q_DISABLE_COPY( Backend )
+ 		class BackendPrivate;
+@@ -163,11 +176,18 @@
+ 		FolderMap _entries;
+ 		typedef QMap<MD5Digest, QList<MD5Digest> > HashMap;
+ 		HashMap _hashes;
+-		QByteArray _passhash; // password hash used for saving the wallet
++		QByteArray _passhash;   // password hash used for saving the wallet
++		BackendCipherType _cipherType; // the kind of encryption used for this wallet
++#ifdef HAVE_QGPGME
++        GpgME::Key      _gpgKey;
++#endif
++		friend class BlowfishPersistHandler;
++        friend class GpgPersistHandler;
+       
+       // open the wallet with the password already set. This is
+       // called internally by both open and openPreHashed.
+-      int openInternal();
++      int openInternal(WId w=0);
++
+ };
+ 
+ }
+diff -Nur kwalletd.than/CMakeLists.txt kwalletd/CMakeLists.txt
+--- kwalletd.than/CMakeLists.txt	2013-06-28 19:12:33.338802909 +0200
++++ kwalletd/CMakeLists.txt	2014-02-26 09:34:12.000000000 +0100
+@@ -1,5 +1,17 @@
+ project(kwalletd)
+ 
++########### find needed packages ######
++find_package(Gpgme)  # Called by FindQGpgme, but since we call some gpgme
++                     # functions ourselves we need to link against it directly.
++find_package(QGpgme) # provided by kdepimlibs
++
++if (GPGME_FOUND AND QGPGME_FOUND)
++    add_definitions(-DHAVE_QGPGME)
++    include_directories(${GPGME_INCLUDES} ${QGPGME_INCLUDE_DIR})
++    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${KDE4_ENABLE_EXCEPTIONS}")
++endif(GPGME_FOUND AND QGPGME_FOUND)
++
++########### build backends #########
+ add_subdirectory(backend)
+ 
+ ########### kwalletd ###############
+@@ -12,13 +24,11 @@
+    main.cpp
+    kbetterthankdialog.cpp
+    kwalletd.cpp
+-   kwalletopenloop.cpp
+    kwalletwizard.cpp
+    ktimeout.cpp
+    kwalletsessionstore.cpp
+ )
+ 
+-
+ kde4_add_ui_files(kwalletd_KDEINIT_SRCS
+    kbetterthankdialogbase.ui
+    kwalletwizardpageexplanation.ui
+@@ -27,13 +37,30 @@
+    kwalletwizardpagepassword.ui
+ )
+ 
++if (GPGME_FOUND AND QGPGME_FOUND)
++    set(kwalletd_KDEINIT_SRCS
++        ${kwalletd_KDEINIT_SRCS}
++        knewwalletdialog.cpp
++    )
++    kde4_add_ui_files(kwalletd_KDEINIT_SRCS
++        kwalletwizardpagepasswordgpg.ui
++        kwalletwizardpagegpgkey.ui
++        knewwalletdialogintro.ui
++        knewwalletdialoggpg.ui
++    )
++endif(GPGME_FOUND AND QGPGME_FOUND)
++
+ find_file(kwallet_xml org.kde.KWallet.xml HINTS ${KDE4_DBUS_INTERFACES_DIR} )
+ 
+ qt4_add_dbus_adaptor( kwalletd_KDEINIT_SRCS ${kwallet_xml} kwalletd.h KWalletD )
+ 
+ kde4_add_kdeinit_executable( kwalletd NOGUI ${kwalletd_KDEINIT_SRCS} )
+ 
+-target_link_libraries(kdeinit_kwalletd  ${KDE4_KDEUI_LIBS} kwalletbackend )
++target_link_libraries(kdeinit_kwalletd ${KDE4_KDEUI_LIBS} kwalletbackend )
++if (GPGME_FOUND AND QGPGME_FOUND)
++    target_link_libraries(kdeinit_kwalletd ${QGPGME_LIBRARIES} )
++endif(GPGME_FOUND AND QGPGME_FOUND)
++
+ install(TARGETS kdeinit_kwalletd  ${INSTALL_TARGETS_DEFAULT_ARGS})
+ 
+ target_link_libraries(kwalletd kdeinit_kwalletd)
+@@ -45,3 +72,4 @@
+ install( FILES kwalletd.notifyrc DESTINATION  ${DATA_INSTALL_DIR}/kwalletd )
+ 
+ add_subdirectory(tests)
++
+diff -Nur kwalletd.than/knewwalletdialog.cpp kwalletd/knewwalletdialog.cpp
+--- kwalletd.than/knewwalletdialog.cpp	1970-01-01 01:00:00.000000000 +0100
++++ kwalletd/knewwalletdialog.cpp	2014-02-26 09:34:12.000000000 +0100
+@@ -0,0 +1,186 @@
++/**
++  * This file is part of the KDE project
++  * Copyright (C) 2013 Valentin Rusu <kde@rusu.info>
++  *
++  * This library is free software; you can redistribute it and/or
++  * modify it under the terms of the GNU Library General Public
++  * License version 2 as published by the Free Software Foundation.
++  *
++  * This library is distributed in the hope that it will be useful,
++  * but WITHOUT ANY WARRANTY; without even the implied warranty of
++  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  * Library General Public License for more details.
++  *
++  * You should have received a copy of the GNU Library General Public License
++  * along with this library; see the file COPYING.LIB.  If not, write to
++  * the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
++  * Boston, MA 02110-1301, USA.
++  */
++
++#include "knewwalletdialog.h"
++#include <klocalizedstring.h>
++#include <QLabel>
++#include <QTextDocument>
++#include <QTimer>
++#include <QTableWidget>
++#include <QTableWidgetItem>
++#include <gpgme.h>
++#include <gpgme++/context.h>
++#include <gpgme++/key.h>
++#include <gpgme++/keylistresult.h>
++#include <kmessagebox.h>
++#include <kdebug.h>
++
++Q_DECLARE_METATYPE(GpgME::Key)
++
++namespace KWallet {
++
++KNewWalletDialog::KNewWalletDialog(const QString &appName, const QString &walletName, QWidget* parent): 
++    QWizard(parent), _intro(0), _introId(0), _gpg(0), _gpgId(0)
++{
++    setOption(HaveFinishButtonOnEarlyPages);
++    _intro = new KNewWalletDialogIntro(appName, walletName, this);
++    _introId = addPage(_intro);
++
++    _gpg = new KNewWalletDialogGpg(appName, walletName, this);
++    _gpgId = addPage(_gpg);
++}
++
++bool KNewWalletDialog::isBlowfish() const
++{
++    return _intro->isBlowfish();
++}
++
++GpgME::Key KNewWalletDialog::gpgKey() const
++{
++    QVariant varKey = field("key");
++    return varKey.value< GpgME::Key >();
++}
++
++KNewWalletDialogIntro::KNewWalletDialogIntro(const QString& appName, const QString& walletName, QWidget* parent): QWizardPage(parent)
++{
++    _ui.setupUi(this);
++    if (appName.isEmpty()){
++        _ui.labelIntro->setText(i18n("<qt>KDE has requested to create a new wallet named '<b>%1</b>'. This is used to store sensitive data in a secure fashion. Please choose the new wallet's type below or click cancel to deny the application's request.</qt>", Qt::escape(walletName)));
++    } else {
++        _ui.labelIntro->setText(i18n("<qt>The application '<b>%1</b>' has requested to create a new wallet named '<b>%2</b>'. This is used to store sensitive data in a secure fashion. Please choose the new wallet's type below or click cancel to deny the application's request.</qt>", Qt::escape(appName), Qt::escape(walletName)));
++    }
++}
++
++void KNewWalletDialogIntro::onBlowfishToggled(bool blowfish)
++{
++    setFinalPage(blowfish);
++}
++
++
++bool KNewWalletDialogIntro::isBlowfish() const
++{
++    return _ui.radioBlowfish->isChecked();
++}
++
++int KNewWalletDialogIntro::nextId() const
++{
++    if (isBlowfish()){
++        return -1;
++    } else {
++        return qobject_cast< const KNewWalletDialog* >(wizard())->gpgId();
++    }
++}
++
++KNewWalletDialogGpg::KNewWalletDialogGpg(const QString& appName, const QString& walletName, QWidget* parent): 
++    QWizardPage(parent), _alreadyInitialized(false), _complete(false)
++{
++    _ui.setupUi(this);
++}
++
++struct AddKeyToList {
++    QTableWidget *_list;
++    int _row;
++    AddKeyToList(QTableWidget *list) : _list(list), _row(0) {}
++    void operator()( const GpgME::Key &k) {
++        GpgME::UserID uid = k.userID(0);
++        QString name(uid.name());
++        if (uid.comment()){
++            name = QString("%1 (%2)").arg(name).arg(uid.comment());
++        }
++        _list->setItem(_row, 0, new QTableWidgetItem(name));
++        _list->setItem(_row, 1, new QTableWidgetItem(uid.email()));
++        _list->setItem(_row, 2, new QTableWidgetItem(k.shortKeyID()));
++        QVariant varKey;
++        varKey.setValue(k);
++        _list->item(_row, 0)->setData(Qt::UserRole, varKey);
++        ++_row;
++    }
++};
++
++void KNewWalletDialogGpg::initializePage()
++{
++    if (_alreadyInitialized)
++        return;
++    
++    registerField("key", this);
++    
++    GpgME::initializeLibrary();
++    GpgME::Error err = GpgME::checkEngine(GpgME::OpenPGP);
++    if (err){
++        kDebug() << "OpenPGP not supported on your system!";
++        KMessageBox::error(this, i18n("The QGpgME library failed to initialize for the OpenPGP protocol. Please check your system's configuration then try again."));
++        emit completeChanged();
++        return;
++    }
++    boost::shared_ptr< GpgME::Context >   _ctx( GpgME::Context::createForProtocol(GpgME::OpenPGP) );
++    if (0 == _ctx) {
++        KMessageBox::error(this, i18n("The QGpgME library failed to initialize for the OpenPGP protocol. Please check your system's configuration then try again."));
++        emit completeChanged();
++        return;
++    }
++    _ctx->setKeyListMode(GpgME::Local);
++
++    std::vector< GpgME::Key > keys;
++    int row =0;
++    err = _ctx->startKeyListing();
++    while (!err) {
++        GpgME::Key k = _ctx->nextKey(err);
++        if (err)
++            break;
++        if (!k.isInvalid() && k.canEncrypt()) {
++            keys.push_back(k);
++        }
++    }
++    _ctx->endKeyListing();
++    
++    if (keys.size() == 0) {
++        KMessageBox::error(this, i18n("Seems that your system has no keys suitable for encryption. Please set-up at least an encryption key, then try again."));
++        emit completeChanged();
++        return;
++    }
++    
++    _ui.listCertificates->setRowCount(keys.size());
++    std::for_each(keys.begin(), keys.end(), AddKeyToList(_ui.listCertificates));
++    _ui.listCertificates->resizeColumnsToContents();
++    _ui.listCertificates->setCurrentCell(0, 0);
++    
++    _alreadyInitialized = true;
++}
++
++void KNewWalletDialogGpg::onItemSelectionChanged()
++{
++    _complete = _ui.listCertificates->currentRow() >= 0;
++    QVariant varKey = _ui.listCertificates->item(_ui.listCertificates->currentRow(), 0)->data(Qt::UserRole);
++    setField("key", varKey);
++    emit completeChanged();
++}
++
++bool KNewWalletDialogGpg::isComplete() const
++{
++    return _complete;
++}
++
++bool KNewWalletDialogGpg::validateCurrentPage()
++{
++    return false;
++}
++
++
++} // namespace
++#include "moc_knewwalletdialog.cpp"
+diff -Nur kwalletd.than/knewwalletdialoggpg.ui kwalletd/knewwalletdialoggpg.ui
+--- kwalletd.than/knewwalletdialoggpg.ui	1970-01-01 01:00:00.000000000 +0100
++++ kwalletd/knewwalletdialoggpg.ui	2014-02-26 09:34:12.000000000 +0100
+@@ -0,0 +1,91 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<ui version="4.0">
++ <class>KNewWalletDialogGpg</class>
++ <widget class="QWidget" name="KNewWalletDialogGpg">
++  <property name="geometry">
++   <rect>
++    <x>0</x>
++    <y>0</y>
++    <width>400</width>
++    <height>300</height>
++   </rect>
++  </property>
++  <layout class="QVBoxLayout" name="verticalLayout">
++   <item>
++    <widget class="QLabel" name="label">
++     <property name="text">
++      <string>Please select the signing key from the list below:</string>
++     </property>
++    </widget>
++   </item>
++   <item>
++    <widget class="QTableWidget" name="listCertificates">
++     <property name="showDropIndicator" stdset="0">
++      <bool>false</bool>
++     </property>
++     <property name="dragDropOverwriteMode">
++      <bool>false</bool>
++     </property>
++     <property name="selectionBehavior">
++      <enum>QAbstractItemView::SelectRows</enum>
++     </property>
++     <property name="showGrid">
++      <bool>false</bool>
++     </property>
++     <property name="columnCount">
++      <number>3</number>
++     </property>
++     <attribute name="horizontalHeaderCascadingSectionResizes">
++      <bool>true</bool>
++     </attribute>
++     <attribute name="horizontalHeaderShowSortIndicator" stdset="0">
++      <bool>true</bool>
++     </attribute>
++     <attribute name="verticalHeaderVisible">
++      <bool>false</bool>
++     </attribute>
++     <attribute name="verticalHeaderHighlightSections">
++      <bool>false</bool>
++     </attribute>
++     <column>
++      <property name="text">
++       <string>Name</string>
++      </property>
++     </column>
++     <column>
++      <property name="text">
++       <string>E-Mail</string>
++      </property>
++     </column>
++     <column>
++      <property name="text">
++       <string>Key-ID</string>
++      </property>
++     </column>
++    </widget>
++   </item>
++  </layout>
++ </widget>
++ <resources/>
++ <connections>
++  <connection>
++   <sender>listCertificates</sender>
++   <signal>itemSelectionChanged()</signal>
++   <receiver>KNewWalletDialogGpg</receiver>
++   <slot>onItemSelectionChanged()</slot>
++   <hints>
++    <hint type="sourcelabel">
++     <x>48</x>
++     <y>89</y>
++    </hint>
++    <hint type="destinationlabel">
++     <x>0</x>
++     <y>81</y>
++    </hint>
++   </hints>
++  </connection>
++ </connections>
++ <slots>
++  <slot>onItemSelectionChanged()</slot>
++ </slots>
++</ui>
+diff -Nur kwalletd.than/knewwalletdialog.h kwalletd/knewwalletdialog.h
+--- kwalletd.than/knewwalletdialog.h	1970-01-01 01:00:00.000000000 +0100
++++ kwalletd/knewwalletdialog.h	2014-02-26 09:34:12.000000000 +0100
+@@ -0,0 +1,81 @@
++/**
++  * This file is part of the KDE project
++  * Copyright (C) 2013 Valentin Rusu <kde@rusu.info>
++  *
++  * This library is free software; you can redistribute it and/or
++  * modify it under the terms of the GNU Library General Public
++  * License version 2 as published by the Free Software Foundation.
++  *
++  * This library is distributed in the hope that it will be useful,
++  * but WITHOUT ANY WARRANTY; without even the implied warranty of
++  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  * Library General Public License for more details.
++  *
++  * You should have received a copy of the GNU Library General Public License
++  * along with this library; see the file COPYING.LIB.  If not, write to
++  * the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
++  * Boston, MA 02110-1301, USA.
++  */
++#ifndef KNEWWALLETDIALOG_H
++#define KNEWWALLETDIALOG_H
++
++#include <QWizard>
++
++#include "ui_knewwalletdialogintro.h"
++#include "ui_knewwalletdialoggpg.h"
++#include <boost/shared_ptr.hpp>
++
++namespace GpgME {
++class Key;
++}
++
++namespace KWallet {
++
++class KNewWalletDialogIntro;
++class KNewWalletDialogGpg;
++
++class KNewWalletDialog : public QWizard {
++    Q_OBJECT
++public:
++    KNewWalletDialog(const QString &appName, const QString &walletName, QWidget* parent = 0);
++
++    bool isBlowfish() const;
++    int gpgId() const { return _gpgId; }
++    GpgME::Key gpgKey() const;
++private:
++    KNewWalletDialogIntro   *_intro;
++    int                     _introId;
++    KNewWalletDialogGpg     *_gpg;
++    int                     _gpgId;
++};
++
++class KNewWalletDialogIntro : public QWizardPage {
++    Q_OBJECT
++public:
++    KNewWalletDialogIntro(const QString &appName, const QString &walletName, QWidget* parent = 0);
++    bool isBlowfish() const;
++    virtual int nextId() const;
++protected Q_SLOTS:
++    void onBlowfishToggled(bool);
++private:
++    Ui_KNewWalletDialogIntro _ui;
++};
++
++class KNewWalletDialogGpg : public QWizardPage {
++    Q_OBJECT
++public:
++    KNewWalletDialogGpg(const QString &appName, const QString &walletName, QWidget* parent = 0);
++    virtual void initializePage();
++    virtual bool isComplete() const;
++    virtual bool validateCurrentPage();
++protected Q_SLOTS:
++    void onItemSelectionChanged();
++private:
++    bool                    _alreadyInitialized;
++    Ui_KNewWalletDialogGpg  _ui;
++    bool                    _complete;
++};
++
++} // namespace
++
++#endif // KNEWWALLETDIALOG_H
+diff -Nur kwalletd.than/knewwalletdialogintro.ui kwalletd/knewwalletdialogintro.ui
+--- kwalletd.than/knewwalletdialogintro.ui	1970-01-01 01:00:00.000000000 +0100
++++ kwalletd/knewwalletdialogintro.ui	2014-02-26 09:34:12.000000000 +0100
+@@ -0,0 +1,128 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<ui version="4.0">
++ <class>KNewWalletDialogIntro</class>
++ <widget class="QWidget" name="KNewWalletDialogIntro">
++  <property name="geometry">
++   <rect>
++    <x>0</x>
++    <y>0</y>
++    <width>341</width>
++    <height>190</height>
++   </rect>
++  </property>
++  <layout class="QVBoxLayout" name="verticalLayout_2">
++   <item>
++    <widget class="KTitleWidget" name="ktitlewidget">
++     <property name="comment">
++      <string>The KDE Wallet System</string>
++     </property>
++    </widget>
++   </item>
++   <item>
++    <widget class="QLabel" name="labelIntro">
++     <property name="sizePolicy">
++      <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
++       <horstretch>0</horstretch>
++       <verstretch>0</verstretch>
++      </sizepolicy>
++     </property>
++     <property name="text">
++      <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;The application '&lt;span style=&quot; font-weight:600;&quot;&gt;%1&lt;/span&gt;' has requested to open the KDE wallet. This is used to store sensitive data in a secure fashion. Please choose the new wallet's type below or click cancel to deny the application's request.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
++     </property>
++     <property name="textFormat">
++      <enum>Qt::RichText</enum>
++     </property>
++     <property name="alignment">
++      <set>Qt::AlignVCenter</set>
++     </property>
++     <property name="wordWrap">
++      <bool>true</bool>
++     </property>
++     <property name="margin">
++      <number>12</number>
++     </property>
++    </widget>
++   </item>
++   <item>
++    <layout class="QHBoxLayout" name="horizontalLayout">
++     <item>
++      <spacer name="horizontalSpacer">
++       <property name="orientation">
++        <enum>Qt::Horizontal</enum>
++       </property>
++       <property name="sizeHint" stdset="0">
++        <size>
++         <width>40</width>
++         <height>20</height>
++        </size>
++       </property>
++      </spacer>
++     </item>
++     <item>
++      <layout class="QVBoxLayout" name="verticalLayout">
++       <item>
++        <widget class="QRadioButton" name="radioBlowfish">
++         <property name="text">
++          <string>Classic, blowfish encrypted file</string>
++         </property>
++        </widget>
++       </item>
++       <item>
++        <widget class="QRadioButton" name="radioGpg">
++         <property name="text">
++          <string>Use GPG encryption, for better protection</string>
++         </property>
++         <property name="checked">
++          <bool>true</bool>
++         </property>
++        </widget>
++       </item>
++      </layout>
++     </item>
++     <item>
++      <spacer name="horizontalSpacer_2">
++       <property name="orientation">
++        <enum>Qt::Horizontal</enum>
++       </property>
++       <property name="sizeHint" stdset="0">
++        <size>
++         <width>40</width>
++         <height>20</height>
++        </size>
++       </property>
++      </spacer>
++     </item>
++    </layout>
++   </item>
++  </layout>
++ </widget>
++ <customwidgets>
++  <customwidget>
++   <class>KTitleWidget</class>
++   <extends>QWidget</extends>
++   <header>ktitlewidget.h</header>
++  </customwidget>
++ </customwidgets>
++ <resources/>
++ <connections>
++  <connection>
++   <sender>radioBlowfish</sender>
++   <signal>toggled(bool)</signal>
++   <receiver>KNewWalletDialogIntro</receiver>
++   <slot>onBlowfishToggled(bool)</slot>
++   <hints>
++    <hint type="sourcelabel">
++     <x>31</x>
++     <y>144</y>
++    </hint>
++    <hint type="destinationlabel">
++     <x>2</x>
++     <y>138</y>
++    </hint>
++   </hints>
++  </connection>
++ </connections>
++ <slots>
++  <slot>onBlowfishToggled(bool)</slot>
++ </slots>
++</ui>
+diff -Nur kwalletd.than/kwalletd.cpp kwalletd/kwalletd.cpp
+--- kwalletd.than/kwalletd.cpp	2013-06-28 19:12:33.340802830 +0200
++++ kwalletd/kwalletd.cpp	2014-02-26 09:34:12.000000000 +0100
+@@ -27,6 +27,10 @@
+ #include "kbetterthankdialog.h"
+ #include "kwalletwizard.h"
+ 
++#ifdef HAVE_QGPGME
++#include "knewwalletdialog.h"
++#endif
++
+ #include <kuniqueapplication.h>
+ #include <ktoolinvocation.h>
+ #include <kconfig.h>
+@@ -45,6 +49,9 @@
+ #include <kpluginfactory.h>
+ #include <kpluginloader.h>
+ #include <KNotification>
++#ifdef HAVE_QGPGME
++#include <gpgme++/key.h>
++#endif
+ 
+ #include <QtCore/QDir>
+ #include <QTextDocument> // Qt::escape
+@@ -55,13 +62,12 @@
+ #include <assert.h>
+ 
+ #include "kwalletadaptor.h"
+-#include "kwalletopenloop.h"
+ 
+ class KWalletTransaction {
+ 
+     public:
+-        KWalletTransaction()
+-            : tType(Unknown), cancelled(false), tId(nextTransactionId)
++        explicit KWalletTransaction(QDBusConnection conn)
++            : tType(Unknown), cancelled(false), tId(nextTransactionId), res(-1), connection(conn)
+         {
+             nextTransactionId++;
+             // make sure the id is never < 0 as that's used for the
+@@ -90,6 +96,9 @@
+         bool modal;
+         bool isPath;
+         int tId; // transaction id
++        int res;
++        QDBusMessage message;
++        QDBusConnection connection;
+ 
+     private:
+         static int nextTransactionId;
+@@ -98,7 +107,10 @@
+ int KWalletTransaction::nextTransactionId = 0;
+ 
+ KWalletD::KWalletD()
+- : QObject(0), _failed(0), _syncTime(5000), _curtrans(0) {
++ : QObject(0), _failed(0), _syncTime(5000), _curtrans(0), _useGpg(false) {
++#ifdef HAVE_QGPGME
++     _useGpg = true;
++#endif
+ 
+ 	srand(time(0));
+ 	_showingFailureNotify = false;
+@@ -113,7 +125,7 @@
+ 	QDBusConnection::sessionBus().registerObject(QLatin1String("/modules/kwalletd"), this);
+ 
+ #ifdef Q_WS_X11
+-	screensaver = new QDBusInterface("org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver");
++    screensaver = 0;
+ #endif
+ 
+ 	reconfigure();
+@@ -138,6 +150,20 @@
+ 	qDeleteAll(_transactions);
+ }
+ 
++#ifdef Q_WS_X11
++void KWalletD::connectToScreenSaver()
++{
++    screensaver = new QDBusInterface("org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver");
++    if (!screensaver->isValid()) {
++        kDebug() << "Service org.freedesktop.ScreenSaver not found. Retrying in 10 seconds...";
++        // keep attempting every 10 seconds
++        QTimer::singleShot(10000, this, SLOT(connectToScreenSaver()));
++    } else {
++        connect(screensaver, SIGNAL(ActiveChanged(bool)), SLOT(screenSaverChanged(bool)));
++        kDebug() << "connected to screen saver service.";
++    }
++}
++#endif
+ 
+ int KWalletD::generateHandle() {
+ 	int rc;
+@@ -198,7 +224,7 @@
+ 				} else if (_curtrans->cancelled) {
+ 					// the wallet opened successfully but the application
+ 					// opening exited/crashed while the dialog was still shown.
+-					KWalletTransaction *_xact = new KWalletTransaction();
++					KWalletTransaction *_xact = new KWalletTransaction(_curtrans->connection);
+ 					_xact->tType = KWalletTransaction::CloseCancelled;
+ 					_xact->appid = _curtrans->appid;
+ 					_xact->wallet = _curtrans->wallet;
+@@ -207,11 +233,13 @@
+ 				}
+ 
+ 				// emit the AsyncOpened signal as a reply
++				_curtrans->res = res;
+ 				emit walletAsyncOpened(_curtrans->tId, res);
+ 				break;
+ 
+ 			case KWalletTransaction::OpenFail:
+ 				// emit the AsyncOpened signal with an invalid handle
++                _curtrans->res = -1;
+ 				emit walletAsyncOpened(_curtrans->tId, -1);
+ 				break;
+ 
+@@ -230,6 +258,15 @@
+ 				break;
+ 		}
+ 
++		// send delayed dbus message reply to the caller
++		if (_curtrans->message.type() != QDBusMessage::InvalidMessage) {
++            if (_curtrans->connection.isConnected()) {
++                QDBusMessage reply = _curtrans->message.createReply();
++                reply << _curtrans->res;
++                _curtrans->connection.send(reply);
++            }
++        }
++
+ 		delete _curtrans;
+ 		_curtrans = 0;
+ 	}
+@@ -237,28 +274,45 @@
+ 	_processing = false;
+ }
+ 
+-
+-
+ int KWalletD::openPath(const QString& path, qlonglong wId, const QString& appid) {
+ 	int tId = openPathAsync(path, wId, appid, false);
+ 	if (tId < 0) {
+ 		return tId;
+ 	}
+ 
++	// NOTE the real return value will be sent by the dbusmessage delayed reply
++	return 0;
+ 	// wait for the open-transaction to be processed
+-	KWalletOpenLoop loop(this);
+-	return loop.waitForAsyncOpen(tId);
++// 	KWalletOpenLoop loop(this);
++// 	return loop.waitForAsyncOpen(tId);
+ }
+ 
+ int KWalletD::open(const QString& wallet, qlonglong wId, const QString& appid) {
+-	int tId = openAsync(wallet, wId, appid, false);
+-	if (tId < 0) {
+-		return tId;
+-	}
+-
+-	// wait for the open-transaction to be processed
+-	KWalletOpenLoop loop(this);
+-	return loop.waitForAsyncOpen(tId);
++    if (!_enabled) { // guard
++        return -1;
++    }
++
++    if (!QRegExp("^[\\w\\^\\&\\'\\@\\{\\}\\[\\]\\,\\$\\=\\!\\-\\#\\(\\)\\%\\.\\+\\_\\s]+$").exactMatch(wallet)) {
++        return -1;
++    }
++
++    KWalletTransaction *xact = new KWalletTransaction(connection());
++    _transactions.append(xact);
++
++    message().setDelayedReply(true);
++    xact->message = message();
++
++    xact->appid = appid;
++    xact->wallet = wallet;
++    xact->wId = wId;
++    xact->modal = true; // mark dialogs as modal, the app has blocking wait
++    xact->tType = KWalletTransaction::Open;
++    xact->isPath = false;
++
++    QTimer::singleShot(0, this, SLOT(processTransactions()));
++    checkActiveDialog();
++    // NOTE the real return value will be sent by the dbusmessage delayed reply
++    return 0;
+ }
+ 
+ int KWalletD::openAsync(const QString& wallet, qlonglong wId, const QString& appid,
+@@ -271,8 +325,8 @@
+ 		return -1;
+ 	}
+ 
+-	KWalletTransaction *xact = new KWalletTransaction;
+-	_transactions.append(xact);
++	KWalletTransaction *xact = new KWalletTransaction(connection());
++    _transactions.append(xact);
+ 
+ 	xact->appid = appid;
+ 	xact->wallet = wallet;
+@@ -298,8 +352,8 @@
+ 		return -1;
+ 	}
+ 
+-	KWalletTransaction *xact = new KWalletTransaction;
+-	_transactions.append(xact);
++    KWalletTransaction *xact = new KWalletTransaction(connection());
++    _transactions.append(xact);
+ 
+ 	xact->appid = appid;
+ 	xact->wallet = path;
+@@ -365,6 +419,7 @@
+                                 qlonglong wId, bool modal, const QString& service) {
+ 	if (_firstUse && !wallets().contains(KWallet::Wallet::LocalWallet()) && !isPath) {
+ 		// First use wizard
++		// TODO GPG adjust new smartcard options gathered by the wizard
+ 		QPointer<KWalletWizard> wiz = new KWalletWizard(0);
+ 		wiz->setWindowTitle(i18n("KDE Wallet Service"));
+ 		setupDialog( wiz, (WId)wId, appid, modal );
+@@ -386,11 +441,23 @@
+ 			}
+ 
+ 			// Create the wallet
++            // TODO GPG select the correct wallet type upon cretion (GPG or blowfish based)
+ 			KWallet::Backend *b = new KWallet::Backend(KWallet::Wallet::LocalWallet());
+-			QString pass = wiz->field("pass1").toString();
+-			QByteArray p(pass.toUtf8(), pass.length());
+-			b->open(p);
+-			p.fill(0);
++#ifdef HAVE_QGPGME
++            if (wiz->field("useBlowfish").toBool()) {
++                b->setCipherType(KWallet::BACKEND_CIPHER_BLOWFISH);
++#endif
++                QString pass = wiz->field("pass1").toString();
++                QByteArray p(pass.toUtf8(), pass.length());
++                b->open(p);
++                p.fill(0);
++#ifdef HAVE_QGPGME
++            } else {
++                assert(wiz->field("useGpg").toBool());
++                b->setCipherType(KWallet::BACKEND_CIPHER_GPG);
++                b->open(wiz->gpgKey());
++            }
++#endif
+ 			b->createFolder(KWallet::Wallet::PasswordFolder());
+ 			b->createFolder(KWallet::Wallet::FormDataFolder());
+ 			b->close(true);
+@@ -439,7 +506,20 @@
+ 		QString password;
+ 		bool emptyPass = false;
+ 		if ((isPath && QFile::exists(wallet)) || (!isPath && KWallet::Backend::exists(wallet))) {
+-			int pwless = b->open(QByteArray());
++            // this open attempt will set wallet type from the file header, even if password is needed
++			int pwless = b->open(QByteArray(), w);
++#ifdef HAVE_QGPGME
++            assert(b->cipherType() != KWallet::BACKEND_CIPHER_UNKNOWN);
++            if (b->cipherType() == KWallet::BACKEND_CIPHER_GPG) {
++                // GPG based wallets do not prompt for password here. Instead, GPG should already have popped pinentry utility for wallet decryption
++                if (!b->isOpen()){
++                    // for some reason, GPG operation failed
++                    delete b;
++                    return -1;
++                }
++                emptyPass = true;
++            } else {
++#endif
+ 			if (0 != pwless || !b->isOpen()) {
+ 				if (pwless == 0) {
+ 					// release, start anew
+@@ -500,7 +580,33 @@
+ 			} else {
+ 				emptyPass = true;
+ 			}
++#ifdef HAVE_QGPGME
++            }
++#endif
+ 		} else {
++            brandNew = true;
++#ifdef HAVE_QGPGME
++            // prompt the user for the new wallet format here
++            KWallet::BackendCipherType newWalletType = KWallet::BACKEND_CIPHER_UNKNOWN;
++
++            boost::shared_ptr<KWallet::KNewWalletDialog> newWalletDlg( new KWallet::KNewWalletDialog(appid, wallet, QWidget::find(w)));
++            GpgME::Key gpgKey;
++            setupDialog( newWalletDlg.get(), (WId)w, appid, true );
++            if (newWalletDlg->exec() == QDialog::Accepted) {
++                newWalletType = newWalletDlg->isBlowfish() ? KWallet::BACKEND_CIPHER_BLOWFISH : KWallet::BACKEND_CIPHER_GPG;
++                gpgKey = newWalletDlg->gpgKey();
++            } else {
++                // user cancelled the dialog box
++                delete b;
++                return -1;
++            }
++            
++            if (newWalletType == KWallet::BACKEND_CIPHER_GPG) {
++                b->setCipherType(newWalletType);
++                b->open(gpgKey);
++            } else if (newWalletType == KWallet::BACKEND_CIPHER_BLOWFISH) {
++#endif // HAVE_QGPGME
++            b->setCipherType(KWallet::BACKEND_CIPHER_BLOWFISH);
+ 			KNewPasswordDialog *kpd = new KNewPasswordDialog();
+ 			if (wallet == KWallet::Wallet::LocalWallet() ||
+ 						 wallet == KWallet::Wallet::NetworkWallet())
+@@ -518,7 +624,6 @@
+ 					kpd->setPrompt(i18n("<qt>The application '<b>%1</b>' has requested to create a new wallet named '<b>%2</b>'. Please choose a password for this wallet, or cancel to deny the application's request.</qt>", Qt::escape(appid), Qt::escape(wallet)));
+ 				}
+ 			}
+-			brandNew = true;
+ 			kpd->setCaption(i18n("KDE Wallet Service"));
+ 			kpd->setButtonGuiItem(KDialog::Ok,KGuiItem(i18n("C&reate"),"document-new"));
+ 			kpd->setPixmap(KIcon("kwalletmanager").pixmap(96, 96));
+@@ -535,16 +640,19 @@
+ 				}
+ 			}
+ 			delete kpd;
++#ifdef HAVE_QGPGME
++            }
++#endif
+ 		}
+ 
+-
+-
+-		if (!emptyPass && (password.isNull() || !b->isOpen())) {
++        
++		if ((b->cipherType() == KWallet::BACKEND_CIPHER_BLOWFISH) && 
++            !emptyPass && (password.isNull() || !b->isOpen())) {
+ 			delete b;
+ 			return -1;
+ 		}
+ 
+-		if (emptyPass && _openPrompt && !isAuthorizedApp(appid, wallet, w)) {
++		if (emptyPass && !isAuthorizedApp(appid, wallet, w)) {
+ 			delete b;
+ 			return -1;
+ 		}
+@@ -598,6 +706,10 @@
+ 
+ 
+ bool KWalletD::isAuthorizedApp(const QString& appid, const QString& wallet, WId w) {
++	if (!_openPrompt) {
++		return true;
++	}
++
+ 	int response = 0;
+ 
+ 	QString thisApp;
+@@ -655,6 +767,7 @@
+ 
+ 
+ int KWalletD::deleteWallet(const QString& wallet) {
++    int result = -1;
+ 	QString path = KGlobal::dirs()->saveLocation("kwallet") + QDir::separator() + wallet + ".kwl";
+ 
+ 	if (QFile::exists(path)) {
+@@ -662,17 +775,27 @@
+ 		internalClose(walletInfo.second, walletInfo.first, true);
+ 		QFile::remove(path);
+ 		emit walletDeleted(wallet);
+-		return 0;
++        // also delete access control entries
++        KConfigGroup cfgAllow = KSharedConfig::openConfig("kwalletrc")->group("Auto Allow");
++        cfgAllow.deleteEntry(wallet);
++
++        KConfigGroup cfgDeny = KSharedConfig::openConfig("kwalletrc")->group("Auto Deny");
++        cfgDeny.deleteEntry(wallet);
++
++        result = 0;
+ 	}
+ 
+-	return -1;
++	return result;
+ }
+ 
+ 
+ void KWalletD::changePassword(const QString& wallet, qlonglong wId, const QString& appid) {
+-	KWalletTransaction *xact = new KWalletTransaction;
++	KWalletTransaction *xact = new KWalletTransaction(connection());
++
++    message().setDelayedReply(true);
++    xact->message = message();
++	// TODO GPG this shouldn't be allowed on a GPG managed wallet; a warning should be displayed about this
+ 
+-	//msg.setDelayedReply(true);
+ 	xact->appid = appid;
+ 	xact->wallet = wallet;
+ 	xact->wId = wId;
+@@ -712,30 +835,40 @@
+ 
+ 	assert(w);
+ 
+-	QPointer<KNewPasswordDialog> kpd = new KNewPasswordDialog();
+-	kpd->setPrompt(i18n("<qt>Please choose a new password for the wallet '<b>%1</b>'.</qt>", Qt::escape(wallet)));
+-	kpd->setCaption(i18n("KDE Wallet Service"));
+-	kpd->setAllowEmptyPasswords(true);
+-	setupDialog( kpd, (WId)wId, appid, false );
+-	if (kpd->exec() == KDialog::Accepted && kpd) {
+-		QString p = kpd->password();
+-		if (!p.isNull()) {
+-			w->setPassword(p.toUtf8());
+-			int rc = w->close(true);
+-			if (rc < 0) {
+-				KMessageBox::sorryWId((WId)wId, i18n("Error re-encrypting the wallet. Password was not changed."), i18n("KDE Wallet Service"));
+-				reclose = true;
+-			} else {
+-				rc = w->open(p.toUtf8());
+-				if (rc < 0) {
+-					KMessageBox::sorryWId((WId)wId, i18n("Error reopening the wallet. Data may be lost."), i18n("KDE Wallet Service"));
+-					reclose = true;
+-				}
+-			}
+-		}
+-	}
++#ifdef HAVE_QGPGME
++    if (w->cipherType() == KWallet::BACKEND_CIPHER_GPG) {
++        QString keyID = w->gpgKey().shortKeyID();
++        assert(!keyID.isNull());
++        KMessageBox::errorWId((WId)wId, i18n("<qt>The <b>%1</b> wallet is encrypted using GPG key <b>%2</b>. Please use <b>GPG</b> tools (such as <b>kleopatra</b>) to change the passphrase associated to that key.</qt>", Qt::escape(wallet), keyID));
++    } else {
++#endif
++        QPointer<KNewPasswordDialog> kpd = new KNewPasswordDialog();
++        kpd->setPrompt(i18n("<qt>Please choose a new password for the wallet '<b>%1</b>'.</qt>", Qt::escape(wallet)));
++        kpd->setCaption(i18n("KDE Wallet Service"));
++        kpd->setAllowEmptyPasswords(true);
++        setupDialog( kpd, (WId)wId, appid, false );
++        if (kpd->exec() == KDialog::Accepted && kpd) {
++            QString p = kpd->password();
++            if (!p.isNull()) {
++                w->setPassword(p.toUtf8());
++                int rc = w->close(true);
++                if (rc < 0) {
++                    KMessageBox::sorryWId((WId)wId, i18n("Error re-encrypting the wallet. Password was not changed."), i18n("KDE Wallet Service"));
++                    reclose = true;
++                } else {
++                    rc = w->open(p.toUtf8());
++                    if (rc < 0) {
++                        KMessageBox::sorryWId((WId)wId, i18n("Error reopening the wallet. Data may be lost."), i18n("KDE Wallet Service"));
++                        reclose = true;
++                    }
++                }
++            }
++        }
+ 
+-	delete kpd;
++        delete kpd;
++#ifdef HAVE_QGPGME
++    }
++#endif
+ 
+ 	if (reclose) {
+ 		internalClose(w, handle, true);
+@@ -842,14 +975,14 @@
+ 	// get the wallet and check if we have a password for it (safety measure)
+ 	if ((b = getWallet(appid, handle))) {
+ 		QString wallet = b->walletName();
+-		b->sync();
++		b->sync(0);
+ 	}
+ }
+ 
+ void KWalletD::timedOutSync(int handle) {
+ 	_syncTimers.removeTimer(handle);
+ 	if (_wallets.contains(handle) && _wallets[handle]) {
+-		_wallets[handle]->sync();
++		_wallets[handle]->sync(0);
+ 	}
+ }
+ 
+@@ -1317,18 +1450,22 @@
+ 	_leaveOpen = walletGroup.readEntry("Leave Open", false);
+ 	bool idleSave = _closeIdle;
+ 	_closeIdle = walletGroup.readEntry("Close When Idle", false);
+-	_openPrompt = walletGroup.readEntry("Prompt on Open", true);
++	_openPrompt = walletGroup.readEntry("Prompt on Open", false);
+ 	int timeSave = _idleTime;
+ 	// in minutes!
+ 	_idleTime = walletGroup.readEntry("Idle Timeout", 10) * 60 * 1000;
+ #ifdef Q_WS_X11
+-	if ( screensaver->isValid() ) {
+-		if (walletGroup.readEntry("Close on Screensaver", false)) {
+-			connect(screensaver, SIGNAL(ActiveChanged(bool)), SLOT(screenSaverChanged(bool)));
+-		} else {
+-			screensaver->disconnect(SIGNAL(ActiveChanged(bool)), this, SLOT(screenSaverChanged(bool)));
+-		}
+-	}
++    if (walletGroup.readEntry("Close on Screensaver", false)) {
++        // BUG 254273 : if kwalletd starts before the screen saver, then the connection fails and kwalletd never receives it's notifications
++        // To fix this, we use a timer and perform periodic connection attempts until connection succeeds
++        QTimer::singleShot(0, this, SLOT(connectToScreenSaver()));
++    } else {
++        if (screensaver && screensaver->isValid()) {
++            screensaver->disconnect(SIGNAL(ActiveChanged(bool)), this, SLOT(screenSaverChanged(bool)));
++            delete screensaver;
++            screensaver = 0;
++        }
++    }
+ #endif
+ 	// Handle idle changes
+ 	if (_closeIdle) {
+diff -Nur kwalletd.than/kwalletd.desktop kwalletd/kwalletd.desktop
+--- kwalletd.than/kwalletd.desktop	2013-06-28 19:12:33.340802830 +0200
++++ kwalletd/kwalletd.desktop	2014-02-26 09:34:12.000000000 +0100
+@@ -18,13 +18,13 @@
+ Name[cs]=Server úschovny
+ Name[csb]=Serwera Wallet
+ Name[da]=Wallet-server
+-Name[de]=Digitale Brieftasche
++Name[de]=Passwortspeicher-Server
+ Name[el]=Εξυπηρετητής πορτοφολιού
+ Name[en_GB]=Wallet Server
+ Name[eo]=Servilo de portilo
+ Name[es]=Servidor de carteras
+ Name[et]=Turvalaeka server
+-Name[eu]=Zorro-zerbitzua
++Name[eu]=Zorro-zerbitzaria
+ Name[fa]=خادم کیف‌پول
+ Name[fi]=Lompakkopalvelin
+ Name[fr]=Serveur de portefeuilles
+@@ -62,7 +62,7 @@
+ Name[pa]=ਵਾਲਿਟ ਸਰਵਰ
+ Name[pl]=Serwer Portfela
+ Name[pt]=Servidor da Carteira
+-Name[pt_BR]=Servidor da carteira
++Name[pt_BR]=Servidor de carteiras
+ Name[ro]=Server de portofel
+ Name[ru]=Wallet Server
+ Name[si]=පසුම්බි ධාරකය
+@@ -98,13 +98,13 @@
+ Comment[cs]=Server úschovny
+ Comment[csb]=Serwera Wallet
+ Comment[da]=Wallet-server
+-Comment[de]=Dienst für die digitale Brieftasche
++Comment[de]=Passwortspeicher-Server
+ Comment[el]=Εξυπηρετητής πορτοφολιού
+ Comment[en_GB]=Wallet Server
+ Comment[eo]=Servilo de portilo
+ Comment[es]=Servidor de carteras
+ Comment[et]=Turvalaeka server
+-Comment[eu]=Zorro-zerbitzua
++Comment[eu]=Zorro-zerbitzaria
+ Comment[fa]=خادم کیف‌پول
+ Comment[fi]=Lompakkopalvelin
+ Comment[fr]=Serveur de portefeuilles
+@@ -142,7 +142,7 @@
+ Comment[pa]=ਵਾਲਿਟ ਸਰਵਰ
+ Comment[pl]=Serwer Portfela
+ Comment[pt]=Servidor da Carteira
+-Comment[pt_BR]=Servidor da carteira
++Comment[pt_BR]=Servidor de carteiras
+ Comment[ro]=Server de portofel
+ Comment[ru]=Служба бумажника
+ Comment[si]=පසුම්බි ධාරකය
+diff -Nur kwalletd.than/kwalletd.h kwalletd/kwalletd.h
+--- kwalletd.than/kwalletd.h	2013-06-28 19:12:33.340802830 +0200
++++ kwalletd/kwalletd.h	2014-02-26 09:34:12.000000000 +0100
+@@ -42,7 +42,6 @@
+ 
+ // @Private
+ class KWalletTransaction;
+-class KWalletSyncTimer;
+ class KWalletSessionStore;
+ 
+ class KWalletD : public QObject, protected QDBusContext {
+@@ -183,6 +182,9 @@
+ 		void notifyFailures();
+ 		void processTransactions();
+ 		void activatePasswordDialog();
++#ifdef Q_WS_X11
++        void connectToScreenSaver();
++#endif
+ 
+ 	private:
+ 		// Internal - open a wallet
+@@ -241,6 +243,8 @@
+ 		// sessions
+ 		KWalletSessionStore _sessions;
+         QDBusServiceWatcher _serviceWatcher;
++
++        bool _useGpg;
+ };
+ 
+ 
+diff -Nur kwalletd.than/kwalletd.notifyrc kwalletd/kwalletd.notifyrc
+--- kwalletd.than/kwalletd.notifyrc	2013-06-28 19:12:33.555794274 +0200
++++ kwalletd/kwalletd.notifyrc	2014-02-26 09:34:12.000000000 +0100
+@@ -10,7 +10,7 @@
+ Comment[ca@valencia]=Cartera
+ Comment[cs]=Úschovna
+ Comment[da]=Tegnebog
+-Comment[de]=Brieftasche
++Comment[de]=Passwortspeicher
+ Comment[el]=Πορτοφόλι
+ Comment[en_GB]=Wallet
+ Comment[eo]=Portilo
+@@ -226,18 +226,20 @@
+ Comment[cs]=Démon úschovny KDE požaduje heslo
+ Comment[csb]=Demóna KDE Wallet żądô parolë
+ Comment[da]=Dæmonen for KDE's tegnebog anmoder om en adgangskode
+-Comment[de]=Die digitale Brieftasche benötigt ein Passwort
++Comment[de]=Der Passwortspeicher benötigt ein Passwort
+ Comment[el]=Ο δαίμονας πορτοφολιού του KDE απαιτεί έναν κωδικό πρόσβασης
+ Comment[en_GB]=The KDE Wallet Dæmon requests a password
+ Comment[eo]=la demono de portilo de KDE postulas pasvorton
+ Comment[es]=El demonio de la cartera de KDE requiere una contraseña
+ Comment[et]=KDE turvalaeka deemon nõuab parooli
+-Comment[eu]=KDE diruzorroaren deabruak pasahitza eskatzen du
++Comment[eu]=KDEren zorroaren daemon-ak pasahitza eskatzen du
++Comment[fa]=شبح Wallte کی‌دی‌ای رمزعبوری را درخواست میکند
+ Comment[fi]=KDE:n Lompakkotaustaprosessi pyytää salasanaa
+ Comment[fr]=Le démon du portefeuille de KDE demande un mot de passe
+ Comment[fy]=The KDE slûf daemon fereasket in wachtwurd
+ Comment[ga]=Tá Deamhan Sparáin KDE ag iarraidh focal faire
+ Comment[gl]=O Daemon de carteiras de KDE pide un contrasinal
++Comment[gu]=KDE વોલેટ ડેમને પાસવર્ડની માંગ કરી છે
+ Comment[he]=תהליך הרקע של הארנק של KDE מבקש סיסמא
+ Comment[hi]=केडीई वॉलेट डेमॉन एक पासवर्ड का अनुरोध करता है
+ Comment[hr]=KDE-ov novčanik daemon zahtijeva zaporku
+@@ -264,12 +266,12 @@
+ Comment[pa]=KDE ਵਾਲਿਟ ਡੈਮਨ ਨੇ ਪਾਸਵਰਡ ਦੀ ਮੰਗ ਕੀਤੀ ਹੈ
+ Comment[pl]=Demon Portfela KDE wymaga hasła
+ Comment[pt]=O Servidor da Carteira do KDE está a pedir uma senha
+-Comment[pt_BR]=O servidor da carteira do KDE está solicitando uma senha
++Comment[pt_BR]=O servidor de carteiras do KDE está solicitando uma senha
+ Comment[ro]=Demonul de portofel KDE cere o parolă
+ Comment[ru]=Бумажник KDE запрашивает пароль
+ Comment[si]=The KDE පසුම්බි ඩීමනය මුරපදයක් ඉල්ලයි
+ Comment[sk]=Démon KDE Wallet vyžaduje heslo
+-Comment[sl]=Pritajeni program KDE-jeve Listnice zahteva geslo
++Comment[sl]=Ozadnji program KDE-jeve Listnice zahteva geslo
+ Comment[sr]=КДЕ‑ов демон новчаника захтева лозинку
+ Comment[sr@ijekavian]=КДЕ‑ов демон новчаника захтијева лозинку
+ Comment[sr@ijekavianlatin]=KDE‑ov demon novčanika zahtijeva lozinku
+@@ -279,10 +281,93 @@
+ Comment[th]=บริการกระเป๋าคุมข้อมูลของ KDE ร้องขอรหัสผ่าน
+ Comment[tr]=KDE Cüzdan Servisi bir parola ister
+ Comment[ug]=KDE ھەميان نازارەتچىسى ئىم سورايدۇ
+-Comment[uk]=Фонова служба кишені KDE надіслала запит на пароль
++Comment[uk]=Фонова служба торбинок KDE надіслала запит на пароль
+ Comment[vi]=Trình nền Wallet KDE yêu cầu một mật khẩu
+ Comment[wa]=Li démon poite-manoye di KDE dimande on scret
+ Comment[x-test]=xxThe KDE Wallet Daemon requests a passwordxx
+ Comment[zh_CN]=KDE 钱包守护程序请求密码
+ Comment[zh_TW]=KDE 錢包守護程式需要密碼
+ Action=Popup
++
++[Event/syncFailed]
++Name=Sync Failed
++Name[bs]=Sinhronizacija neuspjela
++Name[ca]=La sincronització ha fallat
++Name[ca@valencia]=La sincronització ha fallat
++Name[cs]=Synchronizace selhala
++Name[da]=Synkronisering mislykkedes
++Name[de]=Abgleich fehlgeschlagen
++Name[el]=Αποτυχία συγχρονισμού
++Name[es]=Sincronización fallida
++Name[eu]=Sinkronizatzeak huts egin du
++Name[fi]=Synkronointi epäonnistui
++Name[fr]=Échec de la synchronisation
++Name[gl]=Fallou a sincronización
++Name[hu]=A szinkronizálás meghiúsult
++Name[ia]=Il falleva synchronisar
++Name[id]=Sinkronisasi Gagal
++Name[is]=Samræming mistókst
++Name[it]=Sincronizzazione non riuscita
++Name[kk]=Қадамдастыру жаңылды
++Name[nb]=Synkronisering mislyktes
++Name[nds]=Synkroniseren is fehlslaan
++Name[nl]=Synchronisatie mislukt
++Name[nn]=Feil ved synkronisering
++Name[pa]=ਸਿੰਕ ਫੇਲ੍ਹ ਹੈ
++Name[pl]=Nieudana synchronizacja
++Name[pt]=A Sincronização Falhou
++Name[pt_BR]=Falha na sincronização
++Name[ro]=Sincronizare eșuată
++Name[ru]=Сбой записи
++Name[sk]=Synchronizácia zlyhala
++Name[sl]=Uskladitev spodletela
++Name[sr]=Синхронизација пропала
++Name[sr@ijekavian]=Синхронизација пропала
++Name[sr@ijekavianlatin]=Sinhronizacija propala
++Name[sr@latin]=Sinhronizacija propala
++Name[sv]=Synkronisering misslyckades
++Name[tr]=Eşitleme Başarısız
++Name[uk]=Спроба синхронізації зазнала невдачі
++Name[x-test]=xxSync Failedxx
++Name[zh_TW]=同步失敗
++Comment=KDE Wallet System failed to sync a wallet file to disk
++Comment[bs]=KDE Wallet Sistem nije uspio da sinhronizuje datoteku novčanika na disk
++Comment[ca]=El sistema de cartera del KDE ha fallat en sincronitzar un fitxer de cartera al disc
++Comment[ca@valencia]=El sistema de cartera del KDE ha fallat en sincronitzar un fitxer de cartera al disc
++Comment[cs]=Systému úschovny pro KDE selhala synchronizace úschovny na disk
++Comment[da]=KDE's tegnebogsystem kunne ikke synkronisere en tegnebogsfil til disken
++Comment[de]=Abgleich des KDE-Passwortspeicher mit einer Passwortspeicherdatei auf der Festplatte ist fehlgeschlagen.
++Comment[el]=Το σύστημα πορτοφολιού του KDE απέτυχε να συγχρονίσει ενός πορτοφολιού στον δίσκο
++Comment[es]=El sistema de carteras de KDE ha fallado al sincronizar un archivo de cartera con el disco
++Comment[eu]=KDE zorro-sistemak ezin izan du zorro bat diskora sinkronizatu
++Comment[fi]=KDE:n lompakkojärjestelmä ei onnistunut tallentamaan lompakkotiedostoa levylle
++Comment[fr]=Le système du portefeuille de KDE n'a pas réussi à synchroniser un fichier de portefeuille sur le disque
++Comment[gl]=O sistema de carteiras de KDE non conseguiu sincronizar un ficheiro de carteira co disco
++Comment[hu]=A KDE jelszókezelő rendszer nem tudta szinkronizálni a jelszófájlt a lemezre
++Comment[ia]=Le sistema de portafolio de KDE (KDE Wallet System) falleva synchronisar un file de portafolio con le disco
++Comment[id]=Sistem Dompet KDE gagal sinkronisasi berkas dompet ke cakram
++Comment[is]=KDE veskjakerfinu (wallet system) mistókst að samstilla veskisskrá við disk
++Comment[it]=Il sistema di portafogli di KDE non è riuscito a sincronizzare il file del portafogli sul disco
++Comment[kk]=KDE әмиян жүйесінің дискідегі әмиян файлымен қадамдастыру жаңылысы
++Comment[nb]=KDE Wallet System klarte ikke å synkronisere en lommebokfil til disk
++Comment[nds]=Binnen KDE sien Knippsystem lett sik en Knipp nich mit de Datei op de Fastplaat synkroniseren
++Comment[nl]=Het lukte het KDE portefeuillesysteem niet om een portefeuillebestand naar schijf te synchroniseren
++Comment[nn]=Lommeboktenesta klarte ikkje synkronisera lommebokfila til disken
++Comment[pa]=KDE ਵਾਲਿਟ ਸਿਸਟਮ ਡਿਸਕ ਉੱਤੇ ਵਾਲਿਟ ਫਾਇਲ ਨਾਲ ਸਿੰਕ ਕਰਨ ਲਈ ਫੇਲ੍ਹ ਹੈ
++Comment[pl]=Nieudana synchronizacja pliku portfela przez System portfela KDE
++Comment[pt]=O sistema da Carteira do KDE não conseguiu sincronizar um ficheiro da carteira para o disco
++Comment[pt_BR]=O Sistema da Carteiras do KDE não conseguiu sincronizar um arquivo de carteira com o disco
++Comment[ro]=Sistemul de portofele KDE nu a putut sincroniza fișierul unui portofel cu discul
++Comment[ru]=Служба бумажника KDE не смогла записать файл бумажника на диск
++Comment[sk]=Systému KDE peňaženky sa nepodarilo synchronizovať súbor peňaženky na disk
++Comment[sl]=Sistem listnic za KDE ni uspel uskladiti datoteke z listnico na disku
++Comment[sr]=К‑новчаник не може да синхронизује фајл новчаника на диск
++Comment[sr@ijekavian]=К‑новчаник не може да синхронизује фајл новчаника на диск
++Comment[sr@ijekavianlatin]=K‑novčanik ne može da sinhronizuje fajl novčanika na disk
++Comment[sr@latin]=K‑novčanik ne može da sinhronizuje fajl novčanika na disk
++Comment[sv]=KDE:s plånbokssystem misslyckades synkronisera en plånboksfil till disk
++Comment[tr]=KDE Cüzdan Sistemi diske bir cüzdan dosyası eşitlerken başarısız oldu
++Comment[uk]=Система торбинок KDE не змогла синхронізувати дані файла торбинок з диском
++Comment[x-test]=xxKDE Wallet System failed to sync a wallet file to diskxx
++Comment[zh_TW]=KDE 錢包系統在將錢包檔同步到磁碟時失敗
++Action=Popup
+diff -Nur kwalletd.than/kwalletopenloop.cpp kwalletd/kwalletopenloop.cpp
+--- kwalletd.than/kwalletopenloop.cpp	2013-06-28 19:12:33.340802830 +0200
++++ kwalletd/kwalletopenloop.cpp	1970-01-01 01:00:00.000000000 +0100
+@@ -1,46 +0,0 @@
+-// -*- indent-tabs-mode: t; tab-width: 4; c-basic-offset: 4; -*-
+-/*
+-   This file is part of the KDE libraries
+-
+-   Copyright (c) 2008 Michael Leupold <lemma@confuego.org>
+-
+-   This library is free software; you can redistribute it and/or
+-   modify it under the terms of the GNU Library General Public
+-   License as published by the Free Software Foundation; either
+-   version 2 of the License, or (at your option) any later version.
+-
+-   This library is distributed in the hope that it will be useful,
+-   but WITHOUT ANY WARRANTY; without even the implied warranty of
+-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-   Library General Public License for more details.
+-
+-   You should have received a copy of the GNU Library General Public License
+-   along with this library; see the file COPYING.LIB.  If not, write to
+-   the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+-   Boston, MA 02110-1301, USA.
+-
+-*/
+-
+-#include "kwalletopenloop.h"
+-#include "kwalletd.h"
+-
+-int KWalletOpenLoop::waitForAsyncOpen(int tId)
+-{
+-	transaction = tId;
+-	connect(wallet, SIGNAL(walletAsyncOpened(int, int)),
+-                    SLOT(walletAsyncOpened(int, int)));
+-	exec();
+-	disconnect(this, SLOT(walletAsyncOpened(int, int)));
+-	return result;
+-}
+-
+-void KWalletOpenLoop::walletAsyncOpened(int tId, int handle)
+-{
+-	// if our transaction finished, stop waiting
+-	if (tId == transaction) {
+-		result = handle;
+-		quit();
+-	}
+-}
+-
+-#include "kwalletopenloop.moc"
+diff -Nur kwalletd.than/kwalletopenloop.h kwalletd/kwalletopenloop.h
+--- kwalletd.than/kwalletopenloop.h	2013-06-28 19:12:33.340802830 +0200
++++ kwalletd/kwalletopenloop.h	1970-01-01 01:00:00.000000000 +0100
+@@ -1,50 +0,0 @@
+-// -*- indent-tabs-mode: t; tab-width: 4; c-basic-offset: 4; -*-
+-/*
+-   This file is part of the KDE libraries
+-
+-   Copyright (c) 2008 Michael Leupold <lemma@confuego.org>
+-
+-   This library is free software; you can redistribute it and/or
+-   modify it under the terms of the GNU Library General Public
+-   License as published by the Free Software Foundation; either
+-   version 2 of the License, or (at your option) any later version.
+-
+-   This library is distributed in the hope that it will be useful,
+-   but WITHOUT ANY WARRANTY; without even the implied warranty of
+-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-   Library General Public License for more details.
+-
+-   You should have received a copy of the GNU Library General Public License
+-   along with this library; see the file COPYING.LIB.  If not, write to
+-   the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+-   Boston, MA 02110-1301, USA.
+-
+-*/
+-
+-#ifndef KWALLETOPENLOOP_H
+-#define KWALLETOPENLOOP_H
+-
+-#include <QtCore/QEventLoop>
+-
+-class KWalletD;
+-
+-class KWalletOpenLoop : public QEventLoop {
+-	Q_OBJECT
+-	
+-	public:
+-		explicit KWalletOpenLoop(KWalletD* w, QObject* parent = 0)
+-		    : QEventLoop(parent), wallet(w) {}
+-		
+-		// returns the open handle
+-		int waitForAsyncOpen(int tId);
+-		
+-	public slots:
+-		void walletAsyncOpened(int tId, int handle);
+-		
+-	private:
+-		KWalletD* wallet;
+-		int transaction;
+-		int result;
+-};
+-
+-#endif
+diff -Nur kwalletd.than/kwalletwizard.cpp kwalletd/kwalletwizard.cpp
+--- kwalletd.than/kwalletwizard.cpp	2013-06-28 19:12:33.341802790 +0200
++++ kwalletd/kwalletwizard.cpp	2014-02-26 09:34:12.000000000 +0100
+@@ -23,11 +23,25 @@
+ #include "ui_kwalletwizardpageintro.h"
+ #include "ui_kwalletwizardpageoptions.h"
+ #include "ui_kwalletwizardpagepassword.h"
++#ifdef HAVE_QGPGME
++#include "ui_kwalletwizardpagepasswordgpg.h"
++#include "ui_kwalletwizardpagegpgkey.h"
++#endif
+ 
+ #include <QButtonGroup>
+ 
+ #include <klocale.h>
+ 
++#ifdef HAVE_QGPGME
++#include <QComboBox>
++#include <gpgme++/context.h>
++#include <gpgme++/key.h>
++#include <gpgme++/keylistresult.h>
++#include <kdebug.h>
++#include <kmessagebox.h>
++#include <gpgme.h>
++#endif
++
+ class PageIntro : public QWizardPage
+ {
+ public:
+@@ -59,18 +73,23 @@
+     Ui::KWalletWizardPageIntro ui;
+ };
+ 
+-
+ class PagePassword : public QWizardPage
+ {
+ public:
+     PagePassword(QWidget *parent)
+         : QWizardPage(parent)
+     {
++
+         ui.setupUi(this);
+ 
+         registerField("useWallet", ui._useWallet);
+         registerField("pass1", ui._pass1);
+         registerField("pass2", ui._pass2);
++#ifdef HAVE_QGPGME
++        registerField("useGPG", ui._radioGpg);
++        registerField("useBlowfish", ui._radioBlowfish);
++        connect(ui._radioBlowfish, SIGNAL(toggled(bool)), parent, SLOT(passwordPageUpdate()));
++#endif
+ 
+         connect(ui._useWallet, SIGNAL(clicked()), parent, SLOT(passwordPageUpdate()));
+         connect(ui._pass1, SIGNAL(textChanged(QString)), parent, SLOT(passwordPageUpdate()));
+@@ -79,7 +98,20 @@
+ 
+     virtual int nextId() const
+     {
++#ifdef HAVE_QGPGME
++        int nextId = -1;
++        if (field("useWallet").toBool()) {
++            if (field("useBlowfish").toBool()) {
++                nextId = static_cast<KWalletWizard*>(wizard())->wizardType() == KWalletWizard::Basic ? -1 : KWalletWizard::PageOptionsId; // same as non QGPGME case
++            } else {
++                nextId = KWalletWizard::PageGpgKeyId;
++            }
++        }
++
++        return nextId;
++#else
+         return static_cast<KWalletWizard*>(wizard())->wizardType() == KWalletWizard::Basic ? -1 : KWalletWizard::PageOptionsId;
++#endif
+     }
+ 
+     void setMatchLabelText(const QString &text)
+@@ -88,9 +120,96 @@
+     }
+ 
+ private:
++#ifdef HAVE_QGPGME
++    Ui::KWalletWizardPagePasswordGpg ui;
++#else
+     Ui::KWalletWizardPagePassword ui;
++#endif
++};
++
++#ifdef HAVE_QGPGME
++typedef std::vector< GpgME::Key > KeysVector;
++Q_DECLARE_METATYPE(GpgME::Key)
++
++struct AddKeyToCombo {
++    QComboBox *_list;
++    AddKeyToCombo(QComboBox *list) : _list(list) {}
++    void operator()( const GpgME::Key &k) {
++        QString text = QString("%1 (%2)").arg(k.shortKeyID()).arg(k.userID(0).email());
++        QVariant varKey;
++        varKey.setValue(k);
++        _list->addItem(text, varKey);
++    }
+ };
+ 
++class PageGpgKey : public QWizardPage
++{
++public:
++    PageGpgKey(QWidget* parent) 
++        : QWizardPage(parent)
++        , userHasGpgKeys(false)
++    {
++        ui.setupUi(this);
++
++        registerField("gpgKey", ui._gpgKey);
++
++        KeysVector keys;
++        GpgME::initializeLibrary();
++        GpgME::Error err = GpgME::checkEngine(GpgME::OpenPGP);
++        if (err){
++            kDebug() << "OpenPGP not supported on your system!";
++            KMessageBox::error(this, i18n("The QGpgME library failed to initialize for the OpenPGP protocol. Please check your system's configuration then try again."));
++        } else {
++            boost::shared_ptr< GpgME::Context > ctx( GpgME::Context::createForProtocol(GpgME::OpenPGP) );
++            if (0 == ctx) {
++                KMessageBox::error(this, i18n("The QGpgME library failed to initialize for the OpenPGP protocol. Please check your system's configuration then try again."));
++            } else {
++
++            ctx->setKeyListMode(GPGME_KEYLIST_MODE_LOCAL);
++            int row =0;
++            err = ctx->startKeyListing();
++            while (!err) {
++                GpgME::Key k = ctx->nextKey(err);
++                if (err)
++                    break;
++                if (!k.isInvalid() && k.canEncrypt()) {
++                    keys.push_back(k);
++                }
++            }
++            ctx->endKeyListing();
++            }
++        }
++        std::for_each(keys.begin(), keys.end(), AddKeyToCombo(ui._gpgKey));
++
++        userHasGpgKeys = keys.size() >0;
++        if (userHasGpgKeys) {
++            ui.stackedWidget->setCurrentWidget(ui._pageWhenHasKeys);
++        } else {
++            ui.stackedWidget->setCurrentWidget(ui._pageNoKeys);
++            setFinalPage(true);
++        }
++        emit completeChanged();
++    }
++    
++    virtual int nextId() const {
++        return static_cast<KWalletWizard*>(wizard())->wizardType() == KWalletWizard::Basic ? -1 : KWalletWizard::PageOptionsId;
++    }
++
++    virtual bool isComplete() const {
++        return userHasGpgKeys;
++    }
++    
++    bool hasGpgKeys() const { return userHasGpgKeys; }
++
++    GpgME::Key gpgKey() const {
++        QVariant varKey = ui._gpgKey->itemData(field("gpgKey").toInt());
++        return varKey.value< GpgME::Key >();
++    }
++private:
++    Ui::KWalletWizardPageGpgKey ui;
++    bool userHasGpgKeys;
++};
++#endif
+ 
+ class PageOptions : public QWizardPage
+ {
+@@ -134,24 +253,42 @@
+     setPage(PageIntroId, m_pageIntro);
+     m_pagePasswd = new PagePassword(this);
+     setPage(PagePasswordId, m_pagePasswd);
++#ifdef HAVE_QGPGME
++    m_pageGpgKey = new PageGpgKey(this);
++    setPage(PageGpgKeyId, m_pageGpgKey);
++#endif
+     setPage(PageOptionsId, new PageOptions(this));
+     setPage(PageExplanationId, new PageExplanation(this));
++    
++    resize(500, 420);
+ }
+ 
+ void KWalletWizard::passwordPageUpdate()
+ {
+     bool complete = true;
+     if (field("useWallet").toBool()) {
+-        if (field("pass1").toString() == field("pass2").toString()) {
+-            if (field("pass1").toString().isEmpty()) {
+-                m_pagePasswd->setMatchLabelText(i18n("<qt>Password is empty.  <b>(WARNING: Insecure)</b></qt>"));
++#ifdef HAVE_QGPGME
++        if (field("useBlowfish").toBool()) {
++            m_pagePasswd->setFinalPage(wizardType() == Basic);
++            button(NextButton)->setVisible(wizardType() != Basic);
++#endif
++            if (field("pass1").toString() == field("pass2").toString()) {
++                if (field("pass1").toString().isEmpty()) {
++                    m_pagePasswd->setMatchLabelText(i18n("<qt>Password is empty.  <b>(WARNING: Insecure)</b></qt>"));
++                } else {
++                    m_pagePasswd->setMatchLabelText(i18n("Passwords match."));
++                }
+             } else {
+-                m_pagePasswd->setMatchLabelText(i18n("Passwords match."));
++                m_pagePasswd->setMatchLabelText(i18n("Passwords do not match."));
++                complete = false;
+             }
++#ifdef HAVE_QGPGME
+         } else {
+-            m_pagePasswd->setMatchLabelText(i18n("Passwords do not match."));
+-            complete = false;
++            m_pagePasswd->setFinalPage(false);
++            button(NextButton)->setEnabled(true);
++            return;
+         }
++#endif
+     } else {
+         m_pagePasswd->setMatchLabelText(QString());
+     }
+@@ -176,3 +313,8 @@
+     }
+ }
+ 
++#ifdef HAVE_QGPGME
++GpgME::Key KWalletWizard::gpgKey() const {
++    return m_pageGpgKey->gpgKey();
++}
++#endif
+diff -Nur kwalletd.than/kwalletwizard.h kwalletd/kwalletwizard.h
+--- kwalletd.than/kwalletwizard.h	2013-06-28 19:12:33.341802790 +0200
++++ kwalletd/kwalletwizard.h	2014-02-26 09:34:12.000000000 +0100
+@@ -20,9 +20,13 @@
+ #define KWALLETWIZARD_H
+ 
+ #include <QWizard>
++#ifdef HAVE_QGPGME
++#include <gpgme++/key.h>
++#endif
+ 
+-class PageIntro;
++class PageGpgKey;
+ class PagePassword;
++class PageIntro;
+ 
+ class KWalletWizard : public QWizard
+ {
+@@ -37,13 +41,20 @@
+ 
+         static const int PageIntroId = 0;
+         static const int PagePasswordId = 1;
+-        static const int PageOptionsId = 2;
+-        static const int PageExplanationId = 3;
++#ifdef HAVE_QGPGME
++        static const int PageGpgKeyId =2;
++#endif
++        static const int PageOptionsId = 3;
++        static const int PageExplanationId = 4;
+ 
+     KWalletWizard( QWidget *parent = 0 );
+ 
+         WizardType wizardType() const;
+ 
++#ifdef HAVE_QGPGME
++        GpgME::Key gpgKey() const;
++#endif // HAVE_QGPGME
++
+     protected:
+         virtual void initializePage(int id);
+ 
+@@ -53,6 +64,9 @@
+     private:
+         PageIntro *m_pageIntro;
+         PagePassword *m_pagePasswd;
++#ifdef HAVE_QGPGME
++        PageGpgKey *m_pageGpgKey;
++#endif
+ };
+ 
+ #endif
+diff -Nur kwalletd.than/kwalletwizardpageexplanation.ui kwalletd/kwalletwizardpageexplanation.ui
+--- kwalletd.than/kwalletwizardpageexplanation.ui	2013-06-28 19:12:33.341802790 +0200
++++ kwalletd/kwalletwizardpageexplanation.ui	2014-02-26 09:34:12.000000000 +0100
+@@ -1,7 +1,8 @@
+-<ui version="4.0" >
++<?xml version="1.0" encoding="UTF-8"?>
++<ui version="4.0">
+  <class>KWalletWizardPageExplanation</class>
+- <widget class="QWidget" name="KWalletWizardPageExplanation" >
+-  <property name="geometry" >
++ <widget class="QWidget" name="KWalletWizardPageExplanation">
++  <property name="geometry">
+    <rect>
+     <x>0</x>
+     <y>0</y>
+@@ -9,16 +10,16 @@
+     <height>215</height>
+    </rect>
+   </property>
+-  <layout class="QVBoxLayout" >
++  <layout class="QVBoxLayout">
+    <item>
+-    <widget class="QLabel" name="textLabel2_3" >
+-     <property name="text" >
+-      <string>The KDE Wallet system stores your data in a &lt;i>wallet&lt;/i> file on your local hard disk.  The data is only written in encrypted form, presently using the blowfish algorithm with your password as the key.  When a wallet is opened, the wallet manager application will launch and display an icon in the system tray.  You can use this application to manage your wallets.  It even permits you to drag wallets and wallet contents, allowing you to easily copy a wallet to a remote system.</string>
++    <widget class="QLabel" name="textLabel2_3">
++     <property name="text">
++      <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;The KDE Wallet system stores your data in a &lt;span style=&quot; font-style:italic;&quot;&gt;wallet&lt;/span&gt; file on your local hard disk. The data is only written in the encrypted form of your choice - blowfish algorithm with your password as the key or using a GPG encryption key. When a wallet is opened, the wallet manager application will launch and display an icon in the system tray. You can use this application to manage all of your wallets. It even permits you to drag wallets and wallet contents, allowing you to easily copy a wallet to a remote system.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+      </property>
+-     <property name="textFormat" >
++     <property name="textFormat">
+       <enum>Qt::RichText</enum>
+      </property>
+-     <property name="wordWrap" >
++     <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+diff -Nur kwalletd.than/kwalletwizardpagegpgkey.ui kwalletd/kwalletwizardpagegpgkey.ui
+--- kwalletd.than/kwalletwizardpagegpgkey.ui	1970-01-01 01:00:00.000000000 +0100
++++ kwalletd/kwalletwizardpagegpgkey.ui	2014-02-26 09:34:12.000000000 +0100
+@@ -0,0 +1,93 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<ui version="4.0">
++ <class>KWalletWizardPageGpgKey</class>
++ <widget class="QWidget" name="KWalletWizardPageGpgKey">
++  <property name="geometry">
++   <rect>
++    <x>0</x>
++    <y>0</y>
++    <width>436</width>
++    <height>309</height>
++   </rect>
++  </property>
++  <layout class="QVBoxLayout" name="verticalLayout_3">
++   <item>
++    <widget class="QStackedWidget" name="stackedWidget">
++     <property name="currentIndex">
++      <number>0</number>
++     </property>
++     <widget class="QWidget" name="_pageWhenHasKeys">
++      <layout class="QVBoxLayout" name="verticalLayout_2">
++       <item>
++        <widget class="QLabel" name="label_3">
++         <property name="text">
++          <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;The GPG-based wallet use a GPG encryption key to securely encrypt data on disk. The key must be available when decrypting is needed or your wallet will not be accessible. For example, if you choose a SmartCard-based encryption key, the GPG system will prompt you to enter it and its associated PIN when attempting to open the wallet.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
++         </property>
++         <property name="wordWrap">
++          <bool>true</bool>
++         </property>
++        </widget>
++       </item>
++       <item>
++        <layout class="QHBoxLayout" name="horizontalLayout">
++         <item>
++          <widget class="QLabel" name="label">
++           <property name="enabled">
++            <bool>true</bool>
++           </property>
++           <property name="text">
++            <string>Select encryption GPG key:</string>
++           </property>
++          </widget>
++         </item>
++         <item>
++          <widget class="QComboBox" name="_gpgKey">
++           <property name="enabled">
++            <bool>true</bool>
++           </property>
++          </widget>
++         </item>
++        </layout>
++       </item>
++       <item>
++        <spacer name="verticalSpacer">
++         <property name="orientation">
++          <enum>Qt::Vertical</enum>
++         </property>
++         <property name="sizeHint" stdset="0">
++          <size>
++           <width>20</width>
++           <height>173</height>
++          </size>
++         </property>
++        </spacer>
++       </item>
++      </layout>
++     </widget>
++     <widget class="QWidget" name="_pageNoKeys">
++      <layout class="QVBoxLayout" name="verticalLayout">
++       <item>
++        <widget class="QLabel" name="label_2">
++         <property name="sizePolicy">
++          <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
++           <horstretch>0</horstretch>
++           <verstretch>0</verstretch>
++          </sizepolicy>
++         </property>
++         <property name="text">
++          <string>Unable to locate at least one &lt;b&gt;encrypting GPG key&lt;/b&gt;. KDE Wallet needs such &lt;b&gt;encrypting key&lt;/b&gt; to securely store passwords or other sensitive data on disk. If you still want to setup a GPG-based wallet, then cancel this wizard, set-up an &lt;b&gt;encrypting GPG key&lt;/b&gt;, then retry this assistant. Otherwise, you may still click back, then choose a classic, blowfish encrypted file format on the previous page.</string>
++         </property>
++         <property name="wordWrap">
++          <bool>true</bool>
++         </property>
++        </widget>
++       </item>
++      </layout>
++     </widget>
++    </widget>
++   </item>
++  </layout>
++ </widget>
++ <resources/>
++ <connections/>
++</ui>
+diff -Nur kwalletd.than/kwalletwizardpageintro.ui kwalletd/kwalletwizardpageintro.ui
+--- kwalletd.than/kwalletwizardpageintro.ui	2013-06-28 19:12:33.341802790 +0200
++++ kwalletd/kwalletwizardpageintro.ui	2014-02-26 09:34:12.000000000 +0100
+@@ -6,8 +6,8 @@
+    <rect>
+     <x>0</x>
+     <y>0</y>
+-    <width>275</width>
+-    <height>283</height>
++    <width>449</width>
++    <height>327</height>
+    </rect>
+   </property>
+   <layout class="QVBoxLayout" name="verticalLayout">
+diff -Nur kwalletd.than/kwalletwizardpagepasswordgpg.ui kwalletd/kwalletwizardpagepasswordgpg.ui
+--- kwalletd.than/kwalletwizardpagepasswordgpg.ui	1970-01-01 01:00:00.000000000 +0100
++++ kwalletd/kwalletwizardpagepasswordgpg.ui	2014-02-26 09:34:12.000000000 +0100
+@@ -0,0 +1,350 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<ui version="4.0">
++ <class>KWalletWizardPagePasswordGpg</class>
++ <widget class="QWidget" name="KWalletWizardPagePasswordGpg">
++  <property name="geometry">
++   <rect>
++    <x>0</x>
++    <y>0</y>
++    <width>448</width>
++    <height>385</height>
++   </rect>
++  </property>
++  <layout class="QVBoxLayout" name="verticalLayout_2">
++   <item>
++    <widget class="QLabel" name="textLabel3">
++     <property name="text">
++      <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Various applications may attempt to use the KDE wallet to store passwords or other information such as web form data and cookies. If you would like these applications to use the wallet, you must enable it now and choose method for its encryption.&lt;/p&gt;&lt;p&gt;GPG method is more secure, but you must have configured at least one encrypting key on your system.&lt;/p&gt;&lt;p&gt;If you choose the classic format, be warned that the password you choose &lt;span style=&quot; font-style:italic;&quot;&gt;cannot&lt;/span&gt; be recovered if it is lost, and will allow anyone who knows it to obtain all the information contained in the wallet.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
++     </property>
++     <property name="textFormat">
++      <enum>Qt::RichText</enum>
++     </property>
++     <property name="wordWrap">
++      <bool>true</bool>
++     </property>
++    </widget>
++   </item>
++   <item>
++    <widget class="QCheckBox" name="_useWallet">
++     <property name="text">
++      <string>Yes, I wish to use the KDE wallet to store my personal information.</string>
++     </property>
++    </widget>
++   </item>
++   <item>
++    <widget class="QGroupBox" name="_groupBox">
++     <property name="enabled">
++      <bool>false</bool>
++     </property>
++     <property name="sizePolicy">
++      <sizepolicy hsizetype="Preferred" vsizetype="MinimumExpanding">
++       <horstretch>0</horstretch>
++       <verstretch>0</verstretch>
++      </sizepolicy>
++     </property>
++     <property name="title">
++      <string>What kind of encryption do you wish?</string>
++     </property>
++     <layout class="QVBoxLayout" name="verticalLayout">
++      <item>
++       <widget class="QRadioButton" name="_radioGpg">
++        <property name="enabled">
++         <bool>false</bool>
++        </property>
++        <property name="text">
++         <string>Use GPG encryption, for better protection</string>
++        </property>
++        <property name="checked">
++         <bool>true</bool>
++        </property>
++       </widget>
++      </item>
++      <item>
++       <widget class="QRadioButton" name="_radioBlowfish">
++        <property name="enabled">
++         <bool>false</bool>
++        </property>
++        <property name="text">
++         <string>Classic, blowfish encrypted file</string>
++        </property>
++       </widget>
++      </item>
++      <item>
++       <layout class="QHBoxLayout" name="horizontalLayout_2">
++        <item>
++         <spacer>
++          <property name="orientation">
++           <enum>Qt::Horizontal</enum>
++          </property>
++          <property name="sizeType">
++           <enum>QSizePolicy::Expanding</enum>
++          </property>
++          <property name="sizeHint" stdset="0">
++           <size>
++            <width>28</width>
++            <height>28</height>
++           </size>
++          </property>
++         </spacer>
++        </item>
++        <item>
++         <layout class="QHBoxLayout" name="horizontalLayout">
++          <item>
++           <layout class="QVBoxLayout">
++            <property name="spacing">
++             <number>6</number>
++            </property>
++            <property name="margin">
++             <number>0</number>
++            </property>
++            <item>
++             <widget class="QLabel" name="textLabel1_3">
++              <property name="enabled">
++               <bool>false</bool>
++              </property>
++              <property name="text">
++               <string>Enter a new password:</string>
++              </property>
++              <property name="alignment">
++               <set>Qt::AlignAbsolute|Qt::AlignBottom|Qt::AlignCenter|Qt::AlignHCenter|Qt::AlignHorizontal_Mask|Qt::AlignJustify|Qt::AlignLeading|Qt::AlignLeft|Qt::AlignRight|Qt::AlignTop|Qt::AlignTrailing|Qt::AlignVCenter|Qt::AlignVertical_Mask</set>
++              </property>
++              <property name="buddy">
++               <cstring>_pass1</cstring>
++              </property>
++             </widget>
++            </item>
++            <item>
++             <widget class="QLabel" name="textLabel2_3">
++              <property name="enabled">
++               <bool>false</bool>
++              </property>
++              <property name="text">
++               <string>Verify password:</string>
++              </property>
++              <property name="alignment">
++               <set>Qt::AlignAbsolute|Qt::AlignBottom|Qt::AlignCenter|Qt::AlignHCenter|Qt::AlignHorizontal_Mask|Qt::AlignJustify|Qt::AlignLeading|Qt::AlignLeft|Qt::AlignRight|Qt::AlignTop|Qt::AlignTrailing|Qt::AlignVCenter|Qt::AlignVertical_Mask</set>
++              </property>
++              <property name="buddy">
++               <cstring>_pass2</cstring>
++              </property>
++             </widget>
++            </item>
++           </layout>
++          </item>
++          <item>
++           <layout class="QVBoxLayout">
++            <property name="spacing">
++             <number>6</number>
++            </property>
++            <property name="margin">
++             <number>0</number>
++            </property>
++            <item>
++             <widget class="KLineEdit" name="_pass1">
++              <property name="enabled">
++               <bool>false</bool>
++              </property>
++              <property name="echoMode">
++               <enum>QLineEdit::Password</enum>
++              </property>
++             </widget>
++            </item>
++            <item>
++             <widget class="KLineEdit" name="_pass2">
++              <property name="enabled">
++               <bool>false</bool>
++              </property>
++              <property name="echoMode">
++               <enum>QLineEdit::Password</enum>
++              </property>
++             </widget>
++            </item>
++           </layout>
++          </item>
++         </layout>
++        </item>
++        <item>
++         <spacer>
++          <property name="orientation">
++           <enum>Qt::Horizontal</enum>
++          </property>
++          <property name="sizeType">
++           <enum>QSizePolicy::Expanding</enum>
++          </property>
++          <property name="sizeHint" stdset="0">
++           <size>
++            <width>98</width>
++            <height>18</height>
++           </size>
++          </property>
++         </spacer>
++        </item>
++       </layout>
++      </item>
++      <item>
++       <widget class="QLabel" name="_matchLabel">
++        <property name="text">
++         <string/>
++        </property>
++        <property name="alignment">
++         <set>Qt::AlignAbsolute|Qt::AlignBottom|Qt::AlignCenter|Qt::AlignHCenter|Qt::AlignHorizontal_Mask|Qt::AlignJustify|Qt::AlignLeading|Qt::AlignLeft|Qt::AlignRight|Qt::AlignTop|Qt::AlignTrailing|Qt::AlignVCenter|Qt::AlignVertical_Mask</set>
++        </property>
++       </widget>
++      </item>
++      <item>
++       <spacer name="verticalSpacer">
++        <property name="orientation">
++         <enum>Qt::Vertical</enum>
++        </property>
++        <property name="sizeHint" stdset="0">
++         <size>
++          <width>20</width>
++          <height>31</height>
++         </size>
++        </property>
++       </spacer>
++      </item>
++     </layout>
++    </widget>
++   </item>
++  </layout>
++ </widget>
++ <customwidgets>
++  <customwidget>
++   <class>KLineEdit</class>
++   <extends>QLineEdit</extends>
++   <header>klineedit.h</header>
++  </customwidget>
++ </customwidgets>
++ <resources/>
++ <connections>
++  <connection>
++   <sender>_radioBlowfish</sender>
++   <signal>toggled(bool)</signal>
++   <receiver>textLabel1_3</receiver>
++   <slot>setEnabled(bool)</slot>
++   <hints>
++    <hint type="sourcelabel">
++     <x>239</x>
++     <y>220</y>
++    </hint>
++    <hint type="destinationlabel">
++     <x>213</x>
++     <y>249</y>
++    </hint>
++   </hints>
++  </connection>
++  <connection>
++   <sender>_radioBlowfish</sender>
++   <signal>toggled(bool)</signal>
++   <receiver>_pass1</receiver>
++   <slot>setEnabled(bool)</slot>
++   <hints>
++    <hint type="sourcelabel">
++     <x>239</x>
++     <y>220</y>
++    </hint>
++    <hint type="destinationlabel">
++     <x>331</x>
++     <y>249</y>
++    </hint>
++   </hints>
++  </connection>
++  <connection>
++   <sender>_radioBlowfish</sender>
++   <signal>toggled(bool)</signal>
++   <receiver>textLabel2_3</receiver>
++   <slot>setEnabled(bool)</slot>
++   <hints>
++    <hint type="sourcelabel">
++     <x>239</x>
++     <y>220</y>
++    </hint>
++    <hint type="destinationlabel">
++     <x>142</x>
++     <y>277</y>
++    </hint>
++   </hints>
++  </connection>
++  <connection>
++   <sender>_radioBlowfish</sender>
++   <signal>toggled(bool)</signal>
++   <receiver>_pass2</receiver>
++   <slot>setEnabled(bool)</slot>
++   <hints>
++    <hint type="sourcelabel">
++     <x>239</x>
++     <y>220</y>
++    </hint>
++    <hint type="destinationlabel">
++     <x>331</x>
++     <y>277</y>
++    </hint>
++   </hints>
++  </connection>
++  <connection>
++   <sender>_radioBlowfish</sender>
++   <signal>clicked()</signal>
++   <receiver>_pass1</receiver>
++   <slot>setFocus()</slot>
++   <hints>
++    <hint type="sourcelabel">
++     <x>239</x>
++     <y>220</y>
++    </hint>
++    <hint type="destinationlabel">
++     <x>331</x>
++     <y>249</y>
++    </hint>
++   </hints>
++  </connection>
++  <connection>
++   <sender>_useWallet</sender>
++   <signal>toggled(bool)</signal>
++   <receiver>_groupBox</receiver>
++   <slot>setEnabled(bool)</slot>
++   <hints>
++    <hint type="sourcelabel">
++     <x>42</x>
++     <y>112</y>
++    </hint>
++    <hint type="destinationlabel">
++     <x>33</x>
++     <y>193</y>
++    </hint>
++   </hints>
++  </connection>
++  <connection>
++   <sender>_useWallet</sender>
++   <signal>toggled(bool)</signal>
++   <receiver>_radioGpg</receiver>
++   <slot>setEnabled(bool)</slot>
++   <hints>
++    <hint type="sourcelabel">
++     <x>50</x>
++     <y>112</y>
++    </hint>
++    <hint type="destinationlabel">
++     <x>63</x>
++     <y>166</y>
++    </hint>
++   </hints>
++  </connection>
++  <connection>
++   <sender>_useWallet</sender>
++   <signal>toggled(bool)</signal>
++   <receiver>_radioBlowfish</receiver>
++   <slot>setEnabled(bool)</slot>
++   <hints>
++    <hint type="sourcelabel">
++     <x>85</x>
++     <y>112</y>
++    </hint>
++    <hint type="destinationlabel">
++     <x>97</x>
++     <y>220</y>
++    </hint>
++   </hints>
++  </connection>
++ </connections>
++</ui>
+diff -Nur kwalletd.than/main.cpp kwalletd/main.cpp
+--- kwalletd.than/main.cpp	2013-06-28 19:12:33.342802750 +0200
++++ kwalletd/main.cpp	2014-02-26 09:34:12.000000000 +0100
+@@ -38,10 +38,11 @@
+ {
+     KAboutData aboutdata("kwalletd", 0, ki18n("KDE Wallet Service"),
+                          "0.2", ki18n("KDE Wallet Service"),
+-                         KAboutData::License_LGPL, ki18n("(C) 2002-2008 George Staikos, Michael Leupold, Thiago Maceira"));
++                         KAboutData::License_LGPL, ki18n("(C) 2002-2008 George Staikos, Michael Leupold, Thiago Maceira, Valentin Rusu"));
+     aboutdata.addAuthor(ki18n("Michael Leupold"),ki18n("Maintainer"),"lemma@confuego.org");
+     aboutdata.addAuthor(ki18n("George Staikos"),ki18n("Former maintainer"),"staikos@kde.org");
+     aboutdata.addAuthor(ki18n("Thiago Maceira"),ki18n("D-Bus Interface"),"thiago@kde.org");
++    aboutdata.addAuthor(ki18n("Valentin Rusu"),ki18n("GPG backend support"),"kde@rusu.info");
+ 
+     aboutdata.setProgramIconName("kwalletmanager");
+ 
+@@ -65,6 +66,7 @@
+       return (0);
+     }
+ 
++    kDebug() << "kwalletd started";
+     KWalletD walletd;
+     return app.exec();
+ }
+diff -Nur kwalletd.than/tests/CMakeLists.txt kwalletd/tests/CMakeLists.txt
+--- kwalletd.than/tests/CMakeLists.txt	2013-06-28 19:12:33.342802750 +0200
++++ kwalletd/tests/CMakeLists.txt	2014-02-26 09:34:12.000000000 +0100
+@@ -14,10 +14,20 @@
+    ../kwalletwizardpageintro.ui
+    ../kwalletwizardpageoptions.ui
+    ../kwalletwizardpagepassword.ui
++   ../kwalletwizardpagegpgkey.ui
+ )
+ 
++if (QGPGME_FOUND)
++    kde4_add_ui_files(kwalletwizardtest_SRCS
++        ../kwalletwizardpagepasswordgpg.ui)
++endif(QGPGME_FOUND)
++
+ kde4_add_executable(kwalletwizardtest TEST ${kwalletwizardtest_SRCS})
+ target_link_libraries(kwalletwizardtest ${KDE4_KDECORE_LIBS} ${KDE4_KDEUI_LIBS} ${QT_QTGUI_LIBRARY})
++if (QGPGME_FOUND)
++    target_link_libraries(kwalletwizardtest ${QGPGME_LIBRARIES})
++endif(QGPGME_FOUND)
++
+ set( EXECUTABLE_OUTPUT_PATH ${CMAKE_CURRENT_BINARY_DIR} )
+ 
+ include_directories( ${KDE4_KDEUI_INCLUDES} ) # for kwallet.h
